@@ -37,6 +37,8 @@ class BtcReporter:
         icon = "📈" if side == "LONG" else "📉"
         conf = int(round(float(signal.confidence) * 100))
         score = int(signal.bull_score) if int(signal.direction) == 1 else int(signal.bear_score)
+        qty_btc = float(signal.contracts)
+        notional_usd = qty_btc * float(signal.entry_price)
         reason = f"{'Bull' if int(signal.direction) == 1 else 'Bear'} confluence {score}/11"
         if str(getattr(signal, "setup_type", "trend")) == "reversal":
             reason = f"Reversal candlestick + momentum | {reason}"
@@ -44,7 +46,7 @@ class BtcReporter:
             f"{icon} BTC {side} ENTRY\n"
             f"Reason: {reason}\n"
             f"Entry: ${float(signal.entry_price):,.2f} | SL: ${float(signal.sl_price):,.2f} | Target: ${float(signal.target_price):,.2f}\n"
-            f"Size: ${float(signal.contracts):,.2f} | Conf: {conf}%"
+            f"Qty: {qty_btc:,.4f} BTC (~${notional_usd:,.2f}) | Conf: {conf}%"
         )
         self._send(message)
 
@@ -54,16 +56,21 @@ class BtcReporter:
         side = "LONG" if int(record.direction) == 1 else "SHORT"
         entry = float(record.entry_price)
         exit_px = float(record.exit_price or 0.0)
+        qty_btc = float(record.contracts or 0.0)
+        exit_notional_usd = qty_btc * exit_px
+        pnl_usd = float(record.pnl_usd or 0.0)
         pnl_inr = float(record.pnl_inr or 0.0)
         fees_inr = float(record.charges_usd or 0.0) / self.INR_TO_USD
+        usd_sign = "+" if pnl_usd >= 0 else "-"
         inr_sign = "+" if pnl_inr >= 0 else "-"
 
         message = (
             f"🔴 BTC EXIT — {side}\n"
             f"Reason: {record.exit_reason or 'UNKNOWN'}\n"
             f"Entry: ${entry:,.2f} → Exit: ${exit_px:,.2f}\n"
-            f"P&L: {inr_sign}₹{abs(pnl_inr):,.0f} | Fees: ₹{fees_inr:,.0f}\n"
-            f"Balance: ₹{float(capital_inr):,.0f}"
+            f"Qty: {qty_btc:,.4f} BTC (~${exit_notional_usd:,.2f})\n"
+            f"P&L (Net): {usd_sign}${abs(pnl_usd):,.2f} ({inr_sign}₹{abs(pnl_inr):,.2f}) | Fees: ₹{fees_inr:,.2f}\n"
+            f"Balance: ₹{float(capital_inr):,.2f}"
         )
         self._send(message)
 
