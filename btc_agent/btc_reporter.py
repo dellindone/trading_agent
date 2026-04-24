@@ -39,12 +39,16 @@ class BtcReporter:
         score = int(signal.bull_score) if int(signal.direction) == 1 else int(signal.bear_score)
         qty_btc = float(signal.contracts)
         notional_usd = qty_btc * float(signal.entry_price)
+        htf_trend = int(getattr(signal, "htf_trend", 0) or 0)
+        htf_tf = str(getattr(signal, "htf_tf", "15m"))
+        htf_str = "bull (+1)" if htf_trend == 1 else ("bear (-1)" if htf_trend == -1 else "neutral (0)")
         reason = f"{'Bull' if int(signal.direction) == 1 else 'Bear'} confluence {score}/11"
         if str(getattr(signal, "setup_type", "trend")) == "reversal":
             reason = f"Reversal candlestick + momentum | {reason}"
         message = (
             f"{icon} BTC {side} ENTRY\n"
             f"Reason: {reason}\n"
+            f"HTF Trend: {htf_tf} {htf_str}\n"
             f"Entry: ${float(signal.entry_price):,.2f} | SL: ${float(signal.sl_price):,.2f} | Target: ${float(signal.target_price):,.2f}\n"
             f"Qty: {qty_btc:,.4f} BTC (~${notional_usd:,.2f}) | Conf: {conf}%"
         )

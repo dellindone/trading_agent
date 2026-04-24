@@ -316,8 +316,10 @@ class BtcEngine:
         bear_score   = int(last.get("bear_score", 0) or 0)
         long_signal  = int(last.get("long_signal", 0) or 0)
         short_signal = int(last.get("short_signal", 0) or 0)
-        htf_trend = int(last.get("45m_smc_trend", last.get("15m_smc_trend", 0)) or 0)
+        htf_trend_15m = int(last.get("15m_smc_trend", 0) or 0)
+        htf_trend_45m = int(last.get("45m_smc_trend", 0) or 0)
         htf_gate_tf = "45m" if "45m_smc_trend" in merged.columns else "15m"
+        htf_trend = htf_trend_45m if htf_gate_tf == "45m" else htf_trend_15m
         atr_15m      = float(last.get("15m_atr_14", 0.0) or 0.0)
         rsi          = float(last.get("rsi_14", 0.0) or 0.0)
 
@@ -377,7 +379,8 @@ class BtcEngine:
 
         self._last_eval_summary = (
             f"bull_score={bull_score}/11 bear_score={bear_score}/11 rsi={rsi:.1f} "
-            f"atr_15m={atr_15m:.0f} htf_trend={htf_trend:+d}({htf_gate_tf}) "
+            f"atr_15m={atr_15m:.0f} htf_15m={htf_trend_15m:+d} htf_45m={htf_trend_45m:+d} "
+            f"htf_gate={htf_trend:+d}({htf_gate_tf}) "
             f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
         )
 

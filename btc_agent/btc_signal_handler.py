@@ -24,6 +24,8 @@ class BtcTradeSignal:
     bull_score: int = 0
     bear_score: int = 0
     setup_type: str = "trend"
+    htf_trend: int = 0
+    htf_tf: str = "15m"
 
 
 ROUND_TRIP_FEE = 0.0010    # 0.05% taker each side
@@ -79,6 +81,8 @@ class BtcSignalHandler:
         direction = 1 if long_signal == 1 else -1
         bull_score = int(row.get("bull_score", 0) or 0)
         bear_score = int(row.get("bear_score", 0) or 0)
+        htf_tf = "45m" if "45m_smc_trend" in feature_row.columns else "15m"
+        htf_trend = int(row.get("45m_smc_trend", row.get("15m_smc_trend", 0)) or 0)
         is_reversal = (
             (direction == 1 and int(row.get("reversal_long_signal", 0) or 0) == 1)
             or (direction == -1 and int(row.get("reversal_short_signal", 0) or 0) == 1)
@@ -169,4 +173,6 @@ class BtcSignalHandler:
             bull_score=bull_score,
             bear_score=bear_score,
             setup_type="reversal" if is_reversal else "trend",
+            htf_trend=htf_trend,
+            htf_tf=htf_tf,
         )
