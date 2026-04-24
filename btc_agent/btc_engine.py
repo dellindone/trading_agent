@@ -59,6 +59,12 @@ class BtcEngine:
             telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         )
+        self.close_on_shutdown = str(os.getenv("BTC_CLOSE_ON_SHUTDOWN", "false")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         self._started_at: datetime | None = None
         self._last_hourly_key: str | None = None
@@ -477,9 +483,13 @@ class BtcEngine:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
     def _handle_shutdown(self, signum, _frame):
-        logger.info("shutdown signal received, force-closing open trades")
+        logger.info("shutdown signal received")
         self._running = False
-        self.shadow_mode.force_close_all(self.delta_client.get_btc_price() or 0.0, "SHUTDOWN")
+        if self.close_on_shutdown:
+            logger.info("close_on_shutdown enabled; force-closing open trades")
+            self.shadow_mode.force_close_all(self.delta_client.get_btc_price() or 0.0, "SHUTDOWN")
+        else:
+            logger.info("preserving open trades on shutdown (BTC_CLOSE_ON_SHUTDOWN=false)")
         self.delta_client.stop_ws()
         sys.stdout.write("\n")
         sys.stdout.flush()

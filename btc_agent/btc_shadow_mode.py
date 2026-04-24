@@ -23,7 +23,6 @@ from btc_agent.btc_signal_handler import BtcTradeSignal
 TAKER_FEE = 0.0005
 ROUND_TRIP_FEE = 0.0010
 INR_TO_USD = 0.012
-MAX_HOLD_MINUTES = 60          # close trade if open longer than 60 minutes
 COOLDOWN_MINUTES = 5           # no re-entry for 5 min after a TIMEOUT exit
 TRAIL_ACTIVATION_ATR = 1.0
 TRAIL_STEP_ATR = 1.0
@@ -170,13 +169,6 @@ class BtcShadowMode:
                     continue
 
             trade.bars_held += 1
-            elapsed_min = (current_time - trade.entry_time).total_seconds() / 60
-            if elapsed_min >= MAX_HOLD_MINUTES:
-                self._close_trade(trade_id, price, "TIMEOUT", current_time)
-                self._last_timeout_exit = current_time
-                self._last_timeout_direction = trade.signal.direction
-                closed.append(trade_id)
-                continue
 
             self._update_trailing_sl(trade, high=high, low=low, atr=atr)
 
