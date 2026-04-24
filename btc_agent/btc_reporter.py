@@ -38,6 +38,8 @@ class BtcReporter:
         conf = int(round(float(signal.confidence) * 100))
         score = int(signal.bull_score) if int(signal.direction) == 1 else int(signal.bear_score)
         reason = f"{'Bull' if int(signal.direction) == 1 else 'Bear'} confluence {score}/11"
+        if str(getattr(signal, "setup_type", "trend")) == "reversal":
+            reason = f"Reversal candlestick + momentum | {reason}"
         message = (
             f"{icon} BTC {side} ENTRY\n"
             f"Reason: {reason}\n"

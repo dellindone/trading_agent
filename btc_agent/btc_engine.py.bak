@@ -223,59 +223,11 @@ class BtcEngine:
         self._last_rendered_line = line
         self._prev_tick_price = price
 
-    @staticmethod
-    def _drop_incomplete_candles(df: pd.DataFrame, tf_minutes: int) -> pd.DataFrame:
-        if df.empty:
-            return df
-
-        now = datetime.now(UTC)
-        idx = df.index
-        if getattr(idx, "tz", None) is None:
-            now_ts = pd.Timestamp(now).tz_localize(None)
-        else:
-            now_ts = pd.Timestamp(now).tz_convert(idx.tz)
-
-        tf_delta = pd.to_timedelta(int(tf_minutes), unit="m")
-        complete_mask = (idx + tf_delta) <= now_ts
-        return df.loc[complete_mask].copy()
-
-    def _resample_45m_from_15m(self, raw_15m: pd.DataFrame) -> pd.DataFrame:
-        """Build 45m candles from closed 15m bars (no lookahead)."""
-        if raw_15m.empty:
-            return pd.DataFrame()
-
-        base = self._drop_incomplete_candles(raw_15m, tf_minutes=15)
-        if base.empty:
-            return pd.DataFrame()
-
-        agg_map = {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-        cols = [c for c in agg_map if c in base.columns]
-        if set(["open", "high", "low", "close"]) - set(cols):
-            return pd.DataFrame()
-
-        frame = (
-            base[cols]
-            .resample("45min", closed="left", label="left")
-            .agg({k: v for k, v in agg_map.items() if k in cols})
-            .dropna(subset=["open", "high", "low", "close"])
-        )
-        if frame.empty:
-            return frame
-
-        return self._drop_incomplete_candles(frame, tf_minutes=45)
-
     def _poll(self):
         # 1. Fetch candles for all TFs (tick-built if warm, REST if not).
         raw_1m = self._get_candles("1m", bars=350)
         raw_15m = self._get_candles("15m", bars=350)
         raw_1h = self._get_candles("1h", bars=350)
-        raw_45m = self._resample_45m_from_15m(raw_15m)
         if raw_1m.empty:
             logger.warning("poll_skipped: no_1m_candles")
             return
@@ -284,7 +236,6 @@ class BtcEngine:
         feat_1m = build_features(raw_1m)
         feat_15m = build_features(raw_15m) if not raw_15m.empty else pd.DataFrame()
         feat_1h = build_features(raw_1h) if not raw_1h.empty else pd.DataFrame()
-        feat_45m = build_features(raw_45m) if not raw_45m.empty else pd.DataFrame()
         if feat_1m.empty:
             logger.warning("poll_skipped: empty_1m_features")
             return
@@ -292,7 +243,6 @@ class BtcEngine:
         # 3. Merge HTF context into 1m (forward-fill, no lookahead).
         merged = self._merge_htf_context(feat_1m, feat_15m, "15m")
         merged = self._merge_htf_context(merged, feat_1h, "1h")
-        merged = self._merge_htf_context(merged, feat_45m, "45m")
 
         # 4. Compute confluence entry signals.
         merged = compute_entry_signals(merged)
@@ -316,8 +266,7 @@ class BtcEngine:
         bear_score   = int(last.get("bear_score", 0) or 0)
         long_signal  = int(last.get("long_signal", 0) or 0)
         short_signal = int(last.get("short_signal", 0) or 0)
-        htf_trend = int(last.get("45m_smc_trend", last.get("15m_smc_trend", 0)) or 0)
-        htf_gate_tf = "45m" if "45m_smc_trend" in merged.columns else "15m"
+        htf_trend    = int(last.get("15m_smc_trend", 0) or 0)
         atr_15m      = float(last.get("15m_atr_14", 0.0) or 0.0)
         rsi          = float(last.get("rsi_14", 0.0) or 0.0)
 
@@ -367,7 +316,7 @@ class BtcEngine:
             htf_block = (closer == "bull" and htf_trend == -1) or (closer == "bear" and htf_trend == 1)
             if htf_block:
                 outcome_code = "HTF_BLOCK"
-                outcome = f"skip: HTF_BLOCK ({htf_gate_tf}_smc_trend={htf_str} opposes {closer} 1m setup)"
+                outcome = f"skip: HTF_BLOCK (15m_smc_trend={htf_str} opposes {closer} 1m setup)"
             else:
                 outcome_code = f"LOW:{closer[0]}{closer_score}"
                 outcome = f"skip: SCORE_LOW ({closer}_score={closer_score}/11, need 6)"
@@ -377,7 +326,7 @@ class BtcEngine:
 
         self._last_eval_summary = (
             f"bull_score={bull_score}/11 bear_score={bear_score}/11 rsi={rsi:.1f} "
-            f"atr_15m={atr_15m:.0f} htf_trend={htf_trend:+d}({htf_gate_tf}) "
+            f"atr_15m={atr_15m:.0f} htf_trend={htf_trend:+d} "
             f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
         )
 

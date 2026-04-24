@@ -43,52 +43,20 @@ def compute_entry_signals(df) -> pd.DataFrame:
     frame["bull_score"] = bull_score
     frame["bear_score"] = bear_score
 
-    # HTF direction filter:
-    # - Primary gate: 45m trend (resampled from 15m candles).
-    # - Fallback gate: 15m trend when 45m context is unavailable.
-    # Longs require HTF trend to be not bearish; shorts require not bullish.
+    # HTF direction filter: 15m longs only when 1h + 4h are not bearish,
+    # 15m shorts only when 1h + 4h are not bullish.
+    # Columns are present when this function is called after the HTF merge in
+    # run_train_btc.py (Step 3.5) or after _merge_htf_context() in btc_engine.py.
+    # 15m is the primary HTF gate — fast enough to give timely entries/exits.
+    # 1h is intentionally excluded: it lags too much and blocks valid 15m setups.
     htf_bull_ok = pd.Series(True, index=frame.index)
     htf_bear_ok = pd.Series(True, index=frame.index)
-    if "45m_smc_trend" in frame.columns:
-        htf_bull_ok &= (frame["45m_smc_trend"] >= 0)   # not -1 (bearish)
-        htf_bear_ok &= (frame["45m_smc_trend"] <= 0)   # not +1 (bullish)
-    elif "15m_smc_trend" in frame.columns:
+    if "15m_smc_trend" in frame.columns:
         htf_bull_ok &= (frame["15m_smc_trend"] >= 0)   # not -1 (bearish)
         htf_bear_ok &= (frame["15m_smc_trend"] <= 0)   # not +1 (bullish)
 
-    # Reversal override: allow counter-trend entries only with strict confirmation.
-    # This helps catch early reversals while keeping HTF trend discipline.
-    def _col(name: str) -> pd.Series:
-        return frame[name] if name in frame.columns else pd.Series(0, index=frame.index)
-
-    trend_long_signal = (bull_score >= 6) & htf_bull_ok
-    trend_short_signal = (bear_score >= 6) & htf_bear_ok
-
-    reversal_bull_pattern = (_col("is_hammer") == 1) | (_col("is_engulfing_bull") == 1)
-    reversal_bear_pattern = (_col("is_shooting_star") == 1) | (_col("is_engulfing_bear") == 1)
-    reversal_bull_momentum = (frame["rsi_14"] > 52) & (frame["macd_hist"] > 0)
-    reversal_bear_momentum = (frame["rsi_14"] < 48) & (frame["macd_hist"] < 0)
-
-    reversal_long_signal = (
-        (bull_score >= 8)
-        & (~htf_bull_ok)
-        & reversal_bull_pattern
-        & reversal_bull_momentum
-    )
-    reversal_short_signal = (
-        (bear_score >= 8)
-        & (~htf_bear_ok)
-        & reversal_bear_pattern
-        & reversal_bear_momentum
-    )
-
-    frame["trend_long_signal"] = trend_long_signal.astype(int)
-    frame["trend_short_signal"] = trend_short_signal.astype(int)
-    frame["reversal_long_signal"] = reversal_long_signal.astype(int)
-    frame["reversal_short_signal"] = reversal_short_signal.astype(int)
-
-    frame["long_signal"] = (trend_long_signal | reversal_long_signal).astype(int)
-    frame["short_signal"] = (trend_short_signal | reversal_short_signal).astype(int)
+    frame["long_signal"]  = ((bull_score >= 6) & htf_bull_ok).astype(int)
+    frame["short_signal"] = ((bear_score >= 6) & htf_bear_ok).astype(int)
     return frame
 
 

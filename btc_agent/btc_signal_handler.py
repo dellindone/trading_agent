@@ -23,6 +23,7 @@ class BtcTradeSignal:
     atr: float
     bull_score: int = 0
     bear_score: int = 0
+    setup_type: str = "trend"
 
 
 ROUND_TRIP_FEE = 0.0010    # 0.05% taker each side
@@ -38,6 +39,8 @@ class BtcSignalHandler:
     INR_TO_USD      = 0.012
     MAX_FEE_PCT_OF_TP = 0.30
     MAX_LEVERAGE    = 2.0    # 200% = 2x — keeps margin safe on small capital
+    REVERSAL_SIZE_MULT = 0.50
+    REVERSAL_MIN_CONFIDENCE = 0.60
 
     def __init__(self):
         model_dir = Path(__file__).resolve().parents[1] / "data" / "btc" / "models"
@@ -76,6 +79,10 @@ class BtcSignalHandler:
         direction = 1 if long_signal == 1 else -1
         bull_score = int(row.get("bull_score", 0) or 0)
         bear_score = int(row.get("bear_score", 0) or 0)
+        is_reversal = (
+            (direction == 1 and int(row.get("reversal_long_signal", 0) or 0) == 1)
+            or (direction == -1 and int(row.get("reversal_short_signal", 0) or 0) == 1)
+        )
 
         x = feature_row.copy()
         for col in self.feature_cols:
@@ -90,8 +97,9 @@ class BtcSignalHandler:
 
         # Binary model: class-1 probability = win probability.
         win_probability = float(probs[1])
-        if win_probability < self.MIN_CONFIDENCE:
-            return self._reject(f"CONFIDENCE_LOW({win_probability:.3f}<{self.MIN_CONFIDENCE:.2f})")
+        min_confidence = self.REVERSAL_MIN_CONFIDENCE if is_reversal else self.MIN_CONFIDENCE
+        if win_probability < min_confidence:
+            return self._reject(f"CONFIDENCE_LOW({win_probability:.3f}<{min_confidence:.2f})")
 
         # Prefer 15m ATR for meaningful SL/TP distances; fall back to 1m ATR.
         atr_series = feature_row.get("15m_atr_14", feature_row.get("atr_14"))
@@ -128,7 +136,8 @@ class BtcSignalHandler:
         # Position sizing in BTC terms (0.001 BTC increments).
         # Risk X% of capital in USD; divide by SL distance in $ to get BTC size.
         capital_usd = capital_inr * self.INR_TO_USD
-        risk_usd = capital_usd * self.RISK_PCT
+        risk_mult = self.REVERSAL_SIZE_MULT if is_reversal else 1.0
+        risk_usd = capital_usd * self.RISK_PCT * risk_mult
         raw_btc = risk_usd / sl_dist  # BTC needed to lose exactly risk_usd on SL hit
         # Round down to nearest 0.001 BTC increment, enforce minimum.
         contracts = max(BTC_CONTRACT, int(raw_btc / BTC_CONTRACT) * BTC_CONTRACT)
@@ -159,4 +168,5 @@ class BtcSignalHandler:
             atr=float(atr),
             bull_score=bull_score,
             bear_score=bear_score,
+            setup_type="reversal" if is_reversal else "trend",
         )
