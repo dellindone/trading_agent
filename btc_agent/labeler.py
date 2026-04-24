@@ -106,8 +106,8 @@ def compute_entry_signals(df, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataF
     frame["reversal_long_signal"] = reversal_long_signal.astype(int)
     frame["reversal_short_signal"] = reversal_short_signal.astype(int)
 
-    frame["long_signal"] = (trend_long_signal | reversal_long_signal).astype(int)
-    frame["short_signal"] = (trend_short_signal | reversal_short_signal).astype(int)
+    frame["long_signal"] = trend_long_signal.astype(int)
+    frame["short_signal"] = trend_short_signal.astype(int)
     return frame
 
 

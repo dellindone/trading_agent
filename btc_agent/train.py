@@ -8,7 +8,9 @@ import pickle
 from pathlib import Path
 
 import lightgbm as lgb
+import numpy as np
 import pandas as pd
+from sklearn.metrics import accuracy_score
 
 from btc_agent.labeler import apply_ema_pair_features
 
@@ -86,7 +88,7 @@ def build_feature_matrix(df, include_htf=True) -> tuple:
     feature_cols = BASE_FEATURES.copy()
 
     if include_htf:
-        for tf in ["15m", "1h"]:
+        for tf in ["15m", "1h", "4h"]:
             feature_cols += [f"{tf}_{c}" for c in HTF_FEATURES]
 
     feature_cols = [c for c in feature_cols if c in df.columns]
@@ -115,6 +117,7 @@ def walk_forward_train(df, n_splits=5) -> dict:
     reports = []
     best_model = None
     best_score = -1.0
+    best_threshold = 0.5
 
     for fold in range(n_splits):
         train_end = fold_size * (fold + 1)
@@ -136,6 +139,7 @@ def walk_forward_train(df, n_splits=5) -> dict:
                 {
                     "fold": fold + 1,
                     "dir_accuracy": 0.0,
+                    "best_threshold": 0.5,
                     "train_size": int(len(X_train)),
                     "test_size": int(len(X_test)),
                 }
@@ -149,11 +153,11 @@ def walk_forward_train(df, n_splits=5) -> dict:
         model = lgb.LGBMClassifier(
             objective="binary",
             metric="binary_logloss",
-            n_estimators=500,
+            n_estimators=800,
             learning_rate=0.05,
             max_depth=6,
-            num_leaves=31,
-            min_child_samples=50,
+            num_leaves=48,
+            min_child_samples=30,
             subsample=0.8,
             colsample_bytree=0.8,
             reg_alpha=0.1,
@@ -172,16 +176,35 @@ def walk_forward_train(df, n_splits=5) -> dict:
         )
 
         win_prob = model.predict_proba(X_test)[:, 1]
-        y_pred = (win_prob >= 0.5).astype(int)
+        fold_best_threshold = 0.5
+        fold_best_acc = -1.0
+        val_size = max(1, int(len(X_train) * 0.2))
+        if val_size >= len(X_train):
+            val_size = max(1, len(X_train) - 1)
+        X_thresh_val = X_train.iloc[-val_size:]
+        y_thresh_val = y_train.iloc[-val_size:]
+        thresh_probs = model.predict_proba(X_thresh_val)[:, 1]
+
+        y_thresh_val_np = y_thresh_val.to_numpy()
+        for threshold in np.linspace(0.40, 0.69, 30):
+            y_pred_try = (thresh_probs >= float(threshold)).astype(int)
+            acc_try = float(accuracy_score(y_thresh_val_np, y_pred_try))
+            if acc_try > fold_best_acc:
+                fold_best_acc = acc_try
+                fold_best_threshold = float(round(float(threshold), 2))
+
+        y_test_np = y_test.to_numpy()
+        y_pred = (win_prob >= fold_best_threshold).astype(int)
         # Requested metric: correct predictions / total signaled bars.
         total_tr = int(len(y_test))
-        correct = int((y_pred == y_test.to_numpy()).sum())
+        correct = int((y_pred == y_test_np).sum())
         dir_acc = (correct / total_tr) if total_tr > 0 else 0.0
 
         reports.append(
             {
                 "fold": fold + 1,
                 "dir_accuracy": float(dir_acc),
+                "best_threshold": float(fold_best_threshold),
                 "train_size": int(len(X_train)),
                 "test_size": int(len(X_test)),
             }
@@ -190,6 +213,7 @@ def walk_forward_train(df, n_splits=5) -> dict:
         if dir_acc > best_score:
             best_score = float(dir_acc)
             best_model = model
+            best_threshold = float(fold_best_threshold)
 
     return {
         "model": best_model,
@@ -198,6 +222,7 @@ def walk_forward_train(df, n_splits=5) -> dict:
         "reverse_map": reverse_map,
         "reports": reports,
         "best_dir_accuracy": float(best_score if best_score >= 0 else 0.0),
+        "best_threshold": float(best_threshold),
     }
 
 
@@ -242,8 +267,8 @@ def train_final_model(df, feature_cols, label_map) -> lgb.LGBMClassifier:
         n_estimators=1000,
         learning_rate=0.03,
         max_depth=6,
-        num_leaves=31,
-        min_child_samples=50,
+        num_leaves=48,
+        min_child_samples=30,
         subsample=0.8,
         colsample_bytree=0.8,
         reg_alpha=0.1,
@@ -271,6 +296,7 @@ def save_model(result, final_model, ema_fast: int = 8, ema_slow: int = 21, ema_s
         "label_map": {str(k): v for k, v in result["label_map"].items()},
         "reverse_map": {str(k): v for k, v in result["reverse_map"].items()},
         "best_dir_accuracy": result["best_dir_accuracy"],
+        "best_threshold": float(result.get("best_threshold", 0.5) or 0.5),
         "walk_forward_reports": result["reports"],
         "ema_fast": int(ema_fast),
         "ema_slow": int(ema_slow),
@@ -290,6 +316,7 @@ def run_training(n_splits: int = 5, force_ema_search: bool = False) -> None:
     df = merge_htf(df, "15m")
     df = merge_htf(df, "45m")
     df = merge_htf(df, "1h")
+    df = merge_htf(df, "4h")
     meta_path = MODEL_DIR / "model_meta.json"
     best_pair: tuple[int, int] | None = None
     if not force_ema_search and meta_path.exists():
