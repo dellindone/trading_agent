@@ -1,0 +1,8 @@
+# Added by code-review-graph
+.code-review-graph/
+*.pdf
+.claude
+.venv
+*.log
+*.parquet
+*.pyc
