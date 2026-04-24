@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 
 class BtcEngine:
+    BARS_1M = 500
+    BARS_15M = 1200
+    BARS_1H = 500
+
     def __init__(self, capital_inr: float, model_version: str):
         self.capital_inr = float(capital_inr)
         self.model_version = str(model_version)
@@ -76,7 +80,10 @@ class BtcEngine:
         self._latest_display_price: float = 0.0
         self._latest_display_time: datetime | None = None
         self._last_rendered_line: str = ""
-        self._render_interval_sec: float = 0.05
+        self._last_rendered_eval_summary: str = ""
+        self._last_render_ts: float = 0.0
+        self._render_interval_sec: float = 0.20
+        self._render_heartbeat_sec: float = 2.0
         # Keep websocket callback lightweight; heavy work runs off-thread.
         self._tick_work_lock = threading.Lock()
         self._tick_worker_running = False
@@ -88,9 +95,10 @@ class BtcEngine:
         renderer.start()
         # Register tick callback BEFORE starting WS so no ticks are missed.
         self.delta_client.set_tick_callback(self._on_tick)
-        self.delta_client.start_ws(symbols=["BTCUSD", "BTCUSDT"])
+        self.delta_client.start_ws(symbols=["BTCUSDT"])
         self._started_at = datetime.now(UTC)
         self.reporter.send_engine_start_alert(self._started_at)
+        self._bootstrap_from_history()
 
         # Housekeeping loop — heartbeats and daily summary only.
         # All SL/TP and entry decisions are driven by _on_tick() via WebSocket.
@@ -213,6 +221,13 @@ class BtcEngine:
                     self._poll_lock = False
 
     def _print_live_ticker(self, price: float, now: datetime) -> None:
+        now_ts = now.timestamp()
+        summary_changed = self._last_eval_summary != self._last_rendered_eval_summary
+        heartbeat_due = (now_ts - self._last_render_ts) >= self._render_heartbeat_sec
+        # Render immediately on new evaluation result; otherwise throttle noisy tick updates.
+        if not summary_changed and not heartbeat_due:
+            return
+
         line = f"btc = {price:,.2f} | {self._last_eval_summary}"
         if line == self._last_rendered_line:
             return
@@ -221,6 +236,8 @@ class BtcEngine:
         sys.stdout.flush()
         self._last_ticker_width = max(self._last_ticker_width, len(line))
         self._last_rendered_line = line
+        self._last_rendered_eval_summary = self._last_eval_summary
+        self._last_render_ts = now_ts
         self._prev_tick_price = price
 
     @staticmethod
@@ -272,9 +289,9 @@ class BtcEngine:
 
     def _poll(self):
         # 1. Fetch candles for all TFs (tick-built if warm, REST if not).
-        raw_1m = self._get_candles("1m", bars=350)
-        raw_15m = self._get_candles("15m", bars=350)
-        raw_1h = self._get_candles("1h", bars=350)
+        raw_1m = self._get_candles("1m", bars=self.BARS_1M)
+        raw_15m = self._get_candles("15m", bars=self.BARS_15M)
+        raw_1h = self._get_candles("1h", bars=self.BARS_1H)
         raw_45m = self._resample_45m_from_15m(raw_15m)
         if raw_1m.empty:
             logger.warning("poll_skipped: no_1m_candles")
@@ -318,8 +335,10 @@ class BtcEngine:
         short_signal = int(last.get("short_signal", 0) or 0)
         htf_trend_15m = int(last.get("15m_smc_trend", 0) or 0)
         htf_trend_45m = int(last.get("45m_smc_trend", 0) or 0)
-        htf_gate_tf = "45m" if "45m_smc_trend" in merged.columns else "15m"
+        has_45m_context = "45m_smc_trend" in merged.columns
+        htf_gate_tf = "45m" if has_45m_context else "15m"
         htf_trend = htf_trend_45m if htf_gate_tf == "45m" else htf_trend_15m
+        htf_source = "45m_primary" if has_45m_context else "15m_fallback(no_45m_features)"
         atr_15m      = float(last.get("15m_atr_14", 0.0) or 0.0)
         rsi          = float(last.get("rsi_14", 0.0) or 0.0)
 
@@ -380,9 +399,19 @@ class BtcEngine:
         self._last_eval_summary = (
             f"bull_score={bull_score}/11 bear_score={bear_score}/11 rsi={rsi:.1f} "
             f"atr_15m={atr_15m:.0f} htf_15m={htf_trend_15m:+d} htf_45m={htf_trend_45m:+d} "
-            f"htf_gate={htf_trend:+d}({htf_gate_tf}) "
+            f"htf_gate={htf_trend:+d}({htf_gate_tf}) htf_source={htf_source} "
             f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
         )
+
+    def _bootstrap_from_history(self) -> None:
+        """Warm up features from historical candles and evaluate immediately on startup."""
+        try:
+            self._poll()
+            # Avoid duplicate immediate poll on the first tick in the same minute.
+            self._last_candle_minute = int(datetime.now(UTC).timestamp()) // 60
+            logger.info("bootstrap_ready: historical warmup complete")
+        except Exception as e:
+            logger.exception("bootstrap_failed: %s", e)
 
     def _maybe_send_hourly_heartbeat(self, now: datetime):
         if now.minute != 0:

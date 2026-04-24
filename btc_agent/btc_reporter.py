@@ -65,11 +65,12 @@ class BtcReporter:
         pnl_usd = float(record.pnl_usd or 0.0)
         pnl_inr = float(record.pnl_inr or 0.0)
         fees_inr = float(record.charges_usd or 0.0) / self.INR_TO_USD
+        exit_icon = "🟢" if pnl_usd >= 0 else "🔴"
         usd_sign = "+" if pnl_usd >= 0 else "-"
         inr_sign = "+" if pnl_inr >= 0 else "-"
 
         message = (
-            f"🔴 BTC EXIT — {side}\n"
+            f"{exit_icon} BTC EXIT — {side}\n"
             f"Reason: {record.exit_reason or 'UNKNOWN'}\n"
             f"Entry: ${entry:,.2f} → Exit: ${exit_px:,.2f}\n"
             f"Qty: {qty_btc:,.4f} BTC (~${exit_notional_usd:,.2f})\n"

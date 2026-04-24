@@ -23,6 +23,8 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 DELTA_BASE = "https://api.delta.exchange"
 DELTA_WS_URL = "wss://socket.delta.exchange"
+DELTA_MARKET_SYMBOL = "BTCUSDT"
+DELTA_CANDLE_FALLBACK_SYMBOL = "BTCUSD"
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ class DeltaClient:
         self._last_ws_price: float | None = None
         self._last_ws_symbol: str | None = None
         self._last_ws_ts: float = 0.0
-        self._ws_symbols: list[str] = ["BTCUSD", "BTCUSDT"]
+        self._ws_symbols: list[str] = [DELTA_MARKET_SYMBOL]
         self.tick_aggregator = TickAggregator()
         # Optional callback: called on every trade tick with (price, size, ts_ms).
         self._tick_callback: object = None
@@ -95,8 +97,8 @@ class DeltaClient:
         if self._last_ws_price is not None and (now - self._last_ws_ts) <= 8.0:
             return float(self._last_ws_price)
 
-        # Fallback REST (BTCUSDT ticker).
-        url = f"{DELTA_BASE}/v2/tickers/BTCUSDT"
+        # Fallback REST ticker.
+        url = f"{DELTA_BASE}/v2/tickers/{DELTA_MARKET_SYMBOL}"
         try:
             with httpx.Client(timeout=10.0) as client:
                 response = client.get(url)
@@ -124,74 +126,83 @@ class DeltaClient:
             return None
 
     def get_ohlcv(self, resolution: str = "15m", bars: int = 350) -> pd.DataFrame:
-        """Return BTCUSDT OHLCV candles with UTC timestamp index."""
+        """Return market OHLCV candles with UTC timestamp index."""
         if resolution not in self._INTERVAL_SECONDS:
             raise ValueError(f"Unsupported resolution '{resolution}'.")
 
         bars = max(int(bars), 1)
         end_ts = int(time.time())
         start_ts = end_ts - bars * self._INTERVAL_SECONDS[resolution]
+        symbols = [DELTA_MARKET_SYMBOL]
+        if DELTA_CANDLE_FALLBACK_SYMBOL not in symbols:
+            symbols.append(DELTA_CANDLE_FALLBACK_SYMBOL)
 
-        url = f"{DELTA_BASE}/v2/history/candles"
-        params = {
-            "symbol": "BTCUSDT",
-            "resolution": resolution,
-            "start": start_ts,
-            "end": end_ts,
-        }
+        for symbol in symbols:
+            url = f"{DELTA_BASE}/v2/history/candles"
+            params = {
+                "symbol": symbol,
+                "resolution": resolution,
+                "start": start_ts,
+                "end": end_ts,
+            }
 
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.get(url, params=params)
-                response.raise_for_status()
-                payload = response.json()
-        except Exception:
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-        result = payload.get("result") or []
-        if isinstance(result, dict):
-            candles = result.get("candles") or result.get("result") or []
-        else:
-            candles = result
-
-        rows: list[dict] = []
-        for item in candles:
-            if isinstance(item, dict):
-                ts = item.get("time") or item.get("timestamp") or item.get("t")
-                row = {
-                    "timestamp": ts,
-                    "open": item.get("open") or item.get("o"),
-                    "high": item.get("high") or item.get("h"),
-                    "low": item.get("low") or item.get("l"),
-                    "close": item.get("close") or item.get("c"),
-                    "volume": item.get("volume") or item.get("v"),
-                }
-            elif isinstance(item, (list, tuple)) and len(item) >= 6:
-                row = {
-                    "timestamp": item[0],
-                    "open": item[1],
-                    "high": item[2],
-                    "low": item[3],
-                    "close": item[4],
-                    "volume": item[5],
-                }
-            else:
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    response = client.get(url, params=params)
+                    response.raise_for_status()
+                    payload = response.json()
+            except Exception:
                 continue
-            rows.append(row)
 
-        if not rows:
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+            result = payload.get("result") or []
+            if isinstance(result, dict):
+                candles = result.get("candles") or result.get("result") or []
+            else:
+                candles = result
 
-        df = pd.DataFrame(rows)
-        ts = pd.to_numeric(df["timestamp"], errors="coerce")
-        ts = ts.where(ts <= 10_000_000_000, ts // 1000)
-        df["timestamp"] = pd.to_datetime(ts, unit="s", utc=True, errors="coerce")
+            rows: list[dict] = []
+            for item in candles:
+                if isinstance(item, dict):
+                    ts = item.get("time") or item.get("timestamp") or item.get("t")
+                    row = {
+                        "timestamp": ts,
+                        "open": item.get("open") or item.get("o"),
+                        "high": item.get("high") or item.get("h"),
+                        "low": item.get("low") or item.get("l"),
+                        "close": item.get("close") or item.get("c"),
+                        "volume": item.get("volume") or item.get("v"),
+                    }
+                elif isinstance(item, (list, tuple)) and len(item) >= 6:
+                    row = {
+                        "timestamp": item[0],
+                        "open": item[1],
+                        "high": item[2],
+                        "low": item[3],
+                        "close": item[4],
+                        "volume": item[5],
+                    }
+                else:
+                    continue
+                rows.append(row)
 
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if not rows:
+                continue
 
-        df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-        return df[["open", "high", "low", "close", "volume"]].tail(bars)
+            df = pd.DataFrame(rows)
+            ts = pd.to_numeric(df["timestamp"], errors="coerce")
+            ts = ts.where(ts <= 10_000_000_000, ts // 1000)
+            df["timestamp"] = pd.to_datetime(ts, unit="s", utc=True, errors="coerce")
+
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+            if not df.empty:
+                if symbol != DELTA_MARKET_SYMBOL:
+                    logger.debug("ohlcv_fallback_symbol used: %s", symbol)
+                return df[["open", "high", "low", "close", "volume"]].tail(bars)
+
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
     # ------------------------ WebSocket internals ------------------------
 
