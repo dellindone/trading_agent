@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,9 +22,15 @@ from core.risk.capital_tracker import CapitalTracker
 from btc_agent.btc_journal import BtcJournal, BtcTradeRecord
 from btc_agent.btc_signal_handler import BtcTradeSignal
 
-TAKER_FEE = 0.0005
-ROUND_TRIP_FEE = 0.0010
-INR_TO_USD = 0.012
+logger = logging.getLogger(__name__)
+
+FUTURES_TAKER_FEE_RATE = 0.0005
+FUTURES_MAKER_FEE_RATE = 0.0002
+GST_RATE = 0.18
+USD_TO_INR = float(os.getenv("BTC_USD_INR", "83.0"))
+INR_TO_USD = 1.0 / USD_TO_INR if USD_TO_INR > 0 else 0.012
+ENTRY_FEE_MODE = str(os.getenv("BTC_ENTRY_FEE_MODE", "taker")).strip().lower()
+EXIT_FEE_MODE = str(os.getenv("BTC_EXIT_FEE_MODE", "taker")).strip().lower()
 COOLDOWN_MINUTES = 5           # no re-entry for 5 min after a TIMEOUT exit
 TRAIL_ACTIVATION_ATR = 1.0
 TRAIL_STEP_ATR = 1.0
@@ -48,6 +56,25 @@ class BtcShadowMode:
         self._last_timeout_exit: datetime | None = None
         self._last_timeout_direction: int = 0
         self._restore_open_trades()
+
+    def has_open_trades(self) -> bool:
+        return bool(self._open)
+
+    def open_trade_ids(self) -> list[str]:
+        return list(self._open.keys())
+
+    def open_trade_snapshots(self) -> list[tuple[str, int, float]]:
+        return [
+            (str(trade.trade_id), int(trade.signal.direction), float(trade.current_sl))
+            for trade in self._open.values()
+        ]
+
+    def get_any_open_atr(self) -> float:
+        for trade in self._open.values():
+            atr = float(getattr(trade.signal, "atr", 0.0) or 0.0)
+            if atr > 0:
+                return atr
+        return 0.0
 
     def _restore_open_trades(self) -> None:
         open_df = self.journal.load_open_trades()
@@ -136,6 +163,7 @@ class BtcShadowMode:
                 pnl_inr=None,
                 charges_usd=None,
                 model_version=self.model_version,
+                charges_inr=None,
             )
         )
         return trade
@@ -191,8 +219,16 @@ class BtcShadowMode:
                 return
             new_sl = trade.best_price - (TRAIL_STEP_ATR * atr)
             if new_sl > trade.current_sl:
+                old_sl = float(trade.current_sl)
                 trade.current_sl = float(new_sl)
                 self.journal.update_trade(trade.trade_id, {"sl_price": trade.current_sl})
+                logger.info(
+                    "trailing_sl_moved trade_id=%s old_sl=%.2f new_sl=%.2f best_price=%.2f",
+                    trade.trade_id,
+                    old_sl,
+                    trade.current_sl,
+                    trade.best_price,
+                )
         else:
             trade.best_price = min(trade.best_price, low)
             profit = entry - trade.best_price
@@ -200,15 +236,24 @@ class BtcShadowMode:
                 return
             new_sl = trade.best_price + (TRAIL_STEP_ATR * atr)
             if new_sl < trade.current_sl:
+                old_sl = float(trade.current_sl)
                 trade.current_sl = float(new_sl)
                 self.journal.update_trade(trade.trade_id, {"sl_price": trade.current_sl})
+                logger.info(
+                    "trailing_sl_moved trade_id=%s old_sl=%.2f new_sl=%.2f best_price=%.2f",
+                    trade.trade_id,
+                    old_sl,
+                    trade.current_sl,
+                    trade.best_price,
+                )
 
     def _close_trade(self, trade_id: str, exit_price: float, reason: str, timestamp_exit: datetime) -> None:
         trade = self._open.pop(trade_id, None)
         if trade is None:
             return
+        logger.info("trade_closed trade_id=%s exit_price=%.2f reason=%s", trade_id, float(exit_price), str(reason))
 
-        pnl_usd, pnl_inr, charges_usd = self._compute_pnl(trade, exit_price)
+        pnl_usd, pnl_inr, charges_usd, charges_inr = self._compute_pnl(trade, exit_price)
         # pnl_usd and pnl_inr are already NET of fees — do not deduct again.
 
         self.journal.log_exit(
@@ -225,21 +270,28 @@ class BtcShadowMode:
                 "timestamp_exit": timestamp_exit,
                 "exit_reason": str(reason),
                 "charges_usd": float(charges_usd),
+                "charges_inr": float(charges_inr),
                 "pnl_usd": float(pnl_usd),
                 "pnl_inr": float(pnl_inr),
             },
         )
 
-        self.capital_tracker.release_margin(trade_id, float(pnl_usd))
+        self.capital_tracker.release_margin(trade_id, float(pnl_inr))
 
-    def _compute_pnl(self, trade, exit_price) -> tuple[float, float, float]:
+    def _compute_pnl(self, trade, exit_price) -> tuple[float, float, float, float]:
         entry_price = float(trade.signal.entry_price)
         contracts = float(trade.signal.contracts)
         direction = int(trade.signal.direction)
 
-        gross_usd = (float(exit_price) - entry_price) / entry_price * contracts * direction
-        charges_usd = contracts * ROUND_TRIP_FEE
+        gross_usd = (float(exit_price) - entry_price) * contracts * direction
+        entry_notional_usd = abs(entry_price * contracts)
+        exit_notional_usd = abs(float(exit_price) * contracts)
+
+        entry_fee_rate = FUTURES_MAKER_FEE_RATE if ENTRY_FEE_MODE == "maker" else FUTURES_TAKER_FEE_RATE
+        exit_fee_rate = FUTURES_MAKER_FEE_RATE if EXIT_FEE_MODE == "maker" else FUTURES_TAKER_FEE_RATE
+        charges_usd = (entry_notional_usd * entry_fee_rate + exit_notional_usd * exit_fee_rate) * (1.0 + GST_RATE)
+        charges_inr = charges_usd * USD_TO_INR
         net_usd = gross_usd - charges_usd
-        net_inr = net_usd / INR_TO_USD
+        net_inr = net_usd * USD_TO_INR
         # Both pnl_usd and pnl_inr are NET of fees; charges_usd is stored separately.
-        return float(net_usd), float(net_inr), float(charges_usd)
+        return float(net_usd), float(net_inr), float(charges_usd), float(charges_inr)

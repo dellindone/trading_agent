@@ -285,11 +285,6 @@ class DeltaClient:
                 self._last_ws_price = price
                 self._last_ws_symbol = symbol or None
                 self._last_ws_ts = time.time()
-                if self._tick_callback is not None:
-                    try:
-                        self._tick_callback(price, 0.0, time.time() * 1000)
-                    except Exception as cb_exc:
-                        logger.debug("tick_callback error: %s", cb_exc)
             except Exception:
                 pass
 

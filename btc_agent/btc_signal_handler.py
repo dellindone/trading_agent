@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,9 @@ class BtcTradeSignal:
     htf_tf: str = "15m"
 
 
-ROUND_TRIP_FEE = 0.0010    # 0.05% taker each side
+FUTURES_TAKER_FEE_RATE = 0.0005
+GST_RATE = 0.18
+ROUND_TRIP_FEE = (2 * FUTURES_TAKER_FEE_RATE) * (1.0 + GST_RATE)  # 0.118% effective (taker+taker+GST)
 BTC_CONTRACT   = 0.001     # minimum position increment (0.001 BTC)
 
 
@@ -38,7 +41,6 @@ class BtcSignalHandler:
     SL_ATR_MULT     = 1.5
     TP_ATR_MULT     = 3.0
     MIN_RR          = 1.5
-    INR_TO_USD      = 0.012
     MAX_FEE_PCT_OF_TP = 0.30
     MAX_LEVERAGE    = 2.0    # 200% = 2x — keeps margin safe on small capital
     REVERSAL_SIZE_MULT = 0.50
@@ -59,6 +61,8 @@ class BtcSignalHandler:
         self.reverse_map = {int(k): int(v) for k, v in (meta.get("reverse_map") or {}).items()}
         self.ema_fast = int(meta.get("ema_fast", 8) or 8)
         self.ema_slow = int(meta.get("ema_slow", 21) or 21)
+        usd_to_inr = float(os.getenv("BTC_USD_INR", "83.0"))
+        self.INR_TO_USD = (1.0 / usd_to_inr) if usd_to_inr > 0 else 0.012
         self.last_rejection_reason = "NOT_EVALUATED"
 
     def _reject(self, reason: str) -> None:

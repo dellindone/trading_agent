@@ -20,8 +20,13 @@ from model_improver.db import ensure_table_exists, get_engine, paper_trade, upse
 
 logger = logging.getLogger(__name__)
 
-INR_TO_USD = 0.012
-ROUND_TRIP_FEE = 0.0010
+USD_TO_INR = float(os.getenv("BTC_USD_INR", "83.0"))
+INR_TO_USD = 1.0 / USD_TO_INR if USD_TO_INR > 0 else 0.012
+FUTURES_TAKER_FEE_RATE = 0.0005
+FUTURES_MAKER_FEE_RATE = 0.0002
+GST_RATE = 0.18
+ENTRY_FEE_MODE = str(os.getenv("BTC_ENTRY_FEE_MODE", "taker")).strip().lower()
+EXIT_FEE_MODE = str(os.getenv("BTC_EXIT_FEE_MODE", "taker")).strip().lower()
 
 
 @dataclass
@@ -44,6 +49,7 @@ class BtcTradeRecord:
     pnl_inr: float | None
     charges_usd: float | None
     model_version: str
+    charges_inr: float | None = None
 
 
 TRADE_COLUMNS = [
@@ -64,6 +70,7 @@ TRADE_COLUMNS = [
     "pnl_usd",
     "pnl_inr",
     "charges_usd",
+    "charges_inr",
     "model_version",
 ]
 
@@ -91,7 +98,15 @@ def _normalize_row(row: dict) -> dict:
 
 
 def _to_db_row(record: BtcTradeRecord) -> dict:
-    charges_inr = (record.charges_usd or 0.0) / INR_TO_USD
+    charges_inr = float(record.charges_inr) if record.charges_inr is not None else float((record.charges_usd or 0.0) * USD_TO_INR)
+    pnl_net_inr = float(record.pnl_inr) if record.pnl_inr is not None else None
+    if pnl_net_inr is not None:
+        pnl_gross_inr = pnl_net_inr + charges_inr
+        pnl_gross_usd = pnl_gross_inr * INR_TO_USD
+    elif record.pnl_usd is not None:
+        pnl_gross_usd = float(record.pnl_usd)
+    else:
+        pnl_gross_usd = None
     return {
         "trade_id": record.trade_id,
         "instrument": record.symbol,
@@ -117,8 +132,8 @@ def _to_db_row(record: BtcTradeRecord) -> dict:
         "confidence": record.confidence,
         "direction_prob": record.direction_prob,
         "exit_reason": record.exit_reason,
-        "pnl_gross": record.pnl_usd,
-        "pnl_net": record.pnl_inr,
+        "pnl_gross": pnl_gross_usd,
+        "pnl_net": pnl_net_inr,
         "charges": charges_inr,
         "atr_at_entry": record.atr_at_entry,
         "model_version": record.model_version,
@@ -200,6 +215,7 @@ class BtcJournal:
                         "pnl_usd": r.get("pnl_usd"),
                         "pnl_inr": r.get("pnl_net"),
                         "charges_usd": r.get("charges_usd"),
+                        "charges_inr": r.get("charges"),
                         "model_version": r.get("model_version"),
                     }
                 )
@@ -243,6 +259,7 @@ class BtcJournal:
                         "pnl_usd": r.get("pnl_usd"),
                         "pnl_inr": r.get("pnl_net"),
                         "charges_usd": r.get("charges_usd"),
+                        "charges_inr": r.get("charges"),
                         "model_version": r.get("model_version"),
                     }
                 )
@@ -281,17 +298,23 @@ class BtcJournal:
         contracts = float(row["contracts"])
         exit_price = float(exit_price)
 
-        pnl_usd = (exit_price - entry_price) / entry_price * contracts * direction
-        charges_usd = contracts * ROUND_TRIP_FEE
-        pnl_net_usd = pnl_usd - charges_usd
-        pnl_inr = pnl_net_usd / INR_TO_USD
+        gross_usd = (exit_price - entry_price) * contracts * direction
+        entry_notional_usd = abs(entry_price * contracts)
+        exit_notional_usd = abs(exit_price * contracts)
+        entry_fee_rate = FUTURES_MAKER_FEE_RATE if ENTRY_FEE_MODE == "maker" else FUTURES_TAKER_FEE_RATE
+        exit_fee_rate = FUTURES_MAKER_FEE_RATE if EXIT_FEE_MODE == "maker" else FUTURES_TAKER_FEE_RATE
+        charges_usd = (entry_notional_usd * entry_fee_rate + exit_notional_usd * exit_fee_rate) * (1.0 + GST_RATE)
+        pnl_net_usd = gross_usd - charges_usd
+        pnl_inr = pnl_net_usd * USD_TO_INR
+        charges_inr = charges_usd * USD_TO_INR
 
         timestamp_exit = _normalize_timestamp(timestamp_exit)
         all_trades.loc[mask, "timestamp_exit"] = timestamp_exit
         all_trades.loc[mask, "exit_price"] = exit_price
         all_trades.loc[mask, "exit_reason"] = str(exit_reason)
-        all_trades.loc[mask, "pnl_usd"] = float(pnl_usd)
+        all_trades.loc[mask, "pnl_usd"] = float(pnl_net_usd)
         all_trades.loc[mask, "charges_usd"] = float(charges_usd)
+        all_trades.loc[mask, "charges_inr"] = float(charges_inr)
         all_trades.loc[mask, "pnl_inr"] = float(pnl_inr)
         self._write_parquet(all_trades)
 
@@ -315,6 +338,7 @@ class BtcJournal:
             pnl_inr=float(updated_row["pnl_inr"]),
             charges_usd=float(updated_row["charges_usd"]),
             model_version=str(updated_row["model_version"]),
+            charges_inr=float(updated_row["charges_inr"]) if pd.notna(updated_row.get("charges_inr")) else None,
         )
         upsert_trade(self._engine, _to_db_row(record))
 
@@ -374,5 +398,6 @@ class BtcJournal:
             pnl_inr=float(row["pnl_inr"]) if pd.notna(row["pnl_inr"]) else None,
             charges_usd=float(row["charges_usd"]) if pd.notna(row["charges_usd"]) else None,
             model_version=str(row["model_version"]),
+            charges_inr=float(row["charges_inr"]) if ("charges_inr" in row and pd.notna(row["charges_inr"])) else None,
         )
         upsert_trade(self._engine, _to_db_row(record))

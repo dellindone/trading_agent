@@ -1,4 +1,13 @@
 {
+  "permissions": {
+    "allow": [
+      "mcp__code-review-graph__query_graph_tool",
+      "mcp__code-review-graph__detect_changes_tool",
+      "Bash(git -C /Users/aditya/Desktop/chartflix/trading_agent diff 096a1fd..138dd4b -- btc_agent/btc_shadow_mode.py btc_agent/btc_journal.py btc_agent/btc_reporter.py btc_agent/btc_engine.py btc_agent/btc_signal_handler.py btc_agent/data_collector.py btc_agent/labeler.py btc_agent/train.py run_train_btc.py model_improver/db.py)",
+      "Bash(python3 -c ' *)",
+      "mcp__code-review-graph__semantic_search_nodes_tool"
+    ]
+  },
   "hooks": {
     "PostToolUse": [
       {

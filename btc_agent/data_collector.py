@@ -50,34 +50,36 @@ def fetch_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int)
         }
         rows = None
         errors: list[str] = []
-        for attempt in range(1, 7):
-            for base in BINANCE_BASES:
-                url = f"{base}/api/v3/klines"
-                try:
-                    response = _BINANCE_SESSION.get(url, params=params, timeout=20)
-                    # Retry on exchange throttling / transient server errors.
-                    if response.status_code in (429, 500, 502, 503, 504):
-                        raise requests.HTTPError(
-                            f"{response.status_code} from {base}",
-                            response=response,
-                        )
-                    response.raise_for_status()
-                    rows = response.json()
-                    break
-                except requests.RequestException as exc:
-                    errors.append(f"{base}: {exc.__class__.__name__}")
-            if rows is not None:
+        max_attempts = 6
+        for attempt in range(1, max_attempts + 1):
+            base = BINANCE_BASES[(attempt - 1) % len(BINANCE_BASES)]
+            url = f"{base}/api/v3/klines"
+            try:
+                response = _BINANCE_SESSION.get(url, params=params, timeout=20)
+                # Retry on exchange throttling / transient server errors.
+                if response.status_code in (429, 500, 502, 503, 504):
+                    raise requests.HTTPError(
+                        f"{response.status_code} from {base}",
+                        response=response,
+                    )
+                response.raise_for_status()
+                rows = response.json()
                 break
-            sleep_s = min(2.0 * attempt, 12.0)
-            logger.warning(
-                "binance_fetch_retry symbol=%s tf=%s cursor=%s attempt=%d sleep=%.1fs",
-                symbol,
-                interval,
-                cursor,
-                attempt,
-                sleep_s,
-            )
-            time.sleep(sleep_s)
+            except requests.RequestException as exc:
+                errors.append(f"{base}: {exc.__class__.__name__}")
+                sleep_s = min(2.0 * attempt, 12.0)
+                logger.warning(
+                    "binance_fetch_retry symbol=%s tf=%s cursor=%s attempt=%d/%d base=%s sleep=%.1fs",
+                    symbol,
+                    interval,
+                    cursor,
+                    attempt,
+                    max_attempts,
+                    base,
+                    sleep_s,
+                )
+                if attempt < max_attempts:
+                    time.sleep(sleep_s)
 
         if rows is None:
             raise RuntimeError(

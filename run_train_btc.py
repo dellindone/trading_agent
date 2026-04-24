@@ -18,9 +18,9 @@ from btc_agent.train import (
     DATA_DIR,
     HTF_FEATURES,
     PROC_DIR,
+    select_best_ema_pair,
     save_model,
     train_final_model,
-    walk_forward_train,
 )
 
 
@@ -53,6 +53,48 @@ def _merge_htf_into_features(df_1m: pd.DataFrame, tf: str, processed_dir: Path) 
     )
     merged[prefixed] = merged[prefixed].ffill()
     return merged
+
+
+def _build_45m_features_from_15m(processed_dir: Path) -> None:
+    """Resample closed 15m bars into 45m features so train labels match live HTF gate."""
+    src_path = processed_dir / "BTCUSDT_15m_features.parquet"
+    out_path = processed_dir / "BTCUSDT_45m_features.parquet"
+    if not src_path.exists():
+        print(f"  [skip 45m build] missing {src_path}")
+        return
+
+    df_15m = pd.read_parquet(src_path).sort_index()
+    if df_15m.empty:
+        print("  [skip 45m build] 15m features empty")
+        return
+
+    ohlcv_map = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    agg = {col: rule for col, rule in ohlcv_map.items() if col in df_15m.columns}
+    if not agg:
+        print("  [skip 45m build] 15m OHLCV columns unavailable")
+        return
+
+    resampled = (
+        df_15m[list(agg.keys())]
+        .resample("45min", closed="left", label="left")
+        .agg(agg)
+        .dropna(subset=["close"])
+    )
+    if resampled.empty:
+        print("  [skip 45m build] resampled frame empty")
+        return
+
+    from btc_agent.features import build_features
+
+    feat_45m = build_features(resampled)
+    feat_45m.to_parquet(out_path)
+    print(f"  built 45m features -> {out_path}")
 
 
 def run_pipeline(skip_download: bool = False, skip_features: bool = False) -> None:
@@ -95,13 +137,14 @@ def run_pipeline(skip_download: bool = False, skip_features: bool = False) -> No
             feat_df.to_parquet(out_path)
             print(f"  [{tf}] features saved -> {out_path}")
 
-    # Step 3.5: Merge 15m + 1h context into 1m BEFORE labeling so the labeler
+    # Step 3.5: Merge 15m + 45m + 1h context into 1m BEFORE labeling so the labeler
     # can apply the HTF direction filter (long only when HTF bullish, short only when HTF bearish).
-    print("\n[Step 3.5/5] Merging 15m + 1h context into 1m features for HTF direction filter...")
+    print("\n[Step 3.5/5] Merging 15m + 45m + 1h context into 1m features for HTF direction filter...")
+    _build_45m_features_from_15m(processed_dir)
     path_1m_feat = processed_dir / "BTCUSDT_1m_features.parquet"
     if path_1m_feat.exists():
         df_1m_feat = pd.read_parquet(path_1m_feat)
-        for htf in ["15m", "1h"]:
+        for htf in ["15m", "45m", "1h"]:
             df_1m_feat = _merge_htf_into_features(df_1m_feat, htf, processed_dir)
             print(f"  merged {htf} → 1m features (cols: {[c for c in df_1m_feat.columns if c.startswith(htf + '_')]})")
         df_1m_feat.to_parquet(path_1m_feat)
@@ -125,7 +168,7 @@ def run_pipeline(skip_download: bool = False, skip_features: bool = False) -> No
         print_label_stats(labeled_df)
 
     # Step 5: 1m labeled already has correct 15m/1h columns from step 3.5.
-    print("\n[Step 5/5] walk_forward_train() + train_final_model()...")
+    print("\n[Step 5/5] select_best_ema_pair() + train_final_model()...")
     path_1m = processed_dir / "BTCUSDT_1m_labeled.parquet"
     if not path_1m.exists():
         raise FileNotFoundError(f"Missing 1m labeled input: {path_1m}")
@@ -134,9 +177,19 @@ def run_pipeline(skip_download: bool = False, skip_features: bool = False) -> No
     if len(df_1m) > 60:
         df_1m = df_1m.iloc[:-60]  # drop unlabeled forward-sim tail
 
-    result = walk_forward_train(df_1m, n_splits=5)
-    final_model = train_final_model(df_1m, result["feature_cols"], result["label_map"])
-    save_model(result, final_model)
+    best_pair, ema_search_reports, best_result = select_best_ema_pair(df_1m, n_splits=5)
+    ema_fast, ema_slow = best_pair
+    tuned_df = df_1m.copy()
+    from btc_agent.labeler import apply_ema_pair_features
+    tuned_df = apply_ema_pair_features(tuned_df, ema_fast=ema_fast, ema_slow=ema_slow)
+    final_model = train_final_model(tuned_df, best_result["feature_cols"], best_result["label_map"])
+    save_model(
+        best_result,
+        final_model,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        ema_search_reports=ema_search_reports,
+    )
 
     print("\nTraining complete.")
     print(f"Model artifacts saved under: {DATA_DIR / 'models'}")

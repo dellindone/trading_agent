@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 import httpx
@@ -20,6 +21,8 @@ class BtcReporter:
     def __init__(self, telegram_token: str, telegram_chat_id: str):
         self.telegram_token = str(telegram_token or "")
         self.telegram_chat_id = str(telegram_chat_id or "")
+        self.USD_TO_INR = float(os.getenv("BTC_USD_INR", "83.0"))
+        self.INR_TO_USD = 1.0 / self.USD_TO_INR if self.USD_TO_INR > 0 else 0.012
 
     def send_engine_start_alert(self, started_at: datetime):
         local = started_at.astimezone(IST) if started_at.tzinfo else IST.localize(started_at)
@@ -54,8 +57,6 @@ class BtcReporter:
         )
         self._send(message)
 
-    INR_TO_USD = 0.012
-
     def send_exit_alert(self, record: BtcTradeRecord, capital_inr: float = 0.0):
         side = "LONG" if int(record.direction) == 1 else "SHORT"
         entry = float(record.entry_price)
@@ -64,7 +65,7 @@ class BtcReporter:
         exit_notional_usd = qty_btc * exit_px
         pnl_usd = float(record.pnl_usd or 0.0)
         pnl_inr = float(record.pnl_inr or 0.0)
-        fees_inr = float(record.charges_usd or 0.0) / self.INR_TO_USD
+        fees_inr = float(record.charges_inr) if getattr(record, "charges_inr", None) is not None else float(record.charges_usd or 0.0) * self.USD_TO_INR
         exit_icon = "🟢" if pnl_usd >= 0 else "🔴"
         usd_sign = "+" if pnl_usd >= 0 else "-"
         inr_sign = "+" if pnl_inr >= 0 else "-"

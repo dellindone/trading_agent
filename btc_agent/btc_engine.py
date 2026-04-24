@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -35,6 +36,15 @@ from btc_agent.train import HTF_FEATURES
 from core.risk.capital_tracker import CapitalTracker
 
 logger = logging.getLogger(__name__)
+USD_TO_INR = float(os.getenv("BTC_USD_INR", "83.0"))
+
+
+@dataclass
+class TickSnapshot:
+    price: float
+    high: float
+    low: float
+    ts: datetime
 
 
 class BtcEngine:
@@ -76,7 +86,7 @@ class BtcEngine:
         self._live_bar_low: float | None = None
         # Candle-boundary tracking: fire _poll() the moment a new 1m candle opens.
         self._last_candle_minute: int = -1
-        self._poll_lock = False   # simple re-entrancy guard (WebSocket thread vs housekeeping)
+        self._poll_lock = threading.Lock()   # re-entrancy guard (WebSocket worker)
         # Live ticker display state.
         self._prev_tick_price: float = 0.0
         self._tick_count: int = 0
@@ -93,7 +103,8 @@ class BtcEngine:
         # Keep websocket callback lightweight; heavy work runs off-thread.
         self._tick_work_lock = threading.Lock()
         self._tick_worker_running = False
-        self._pending_tick: tuple[float, datetime] | None = None
+        self._pending_tick: TickSnapshot | None = None
+        self._sl_tp_candle_fallback_count: int = 0
 
     def run(self):
         self._install_signal_handlers()
@@ -151,7 +162,9 @@ class BtcEngine:
 
         # 1. Update live bar bounds tick-by-tick.
         self._update_live_bar_bounds(now, price)
-        self._schedule_tick_work(price, now)
+        snap_high = self._live_bar_high if self._live_bar_high is not None else price
+        snap_low = self._live_bar_low if self._live_bar_low is not None else price
+        self._schedule_tick_work(price, snap_high, snap_low, now)
 
     def _render_loop(self) -> None:
         while self._running:
@@ -163,10 +176,13 @@ class BtcEngine:
                 self._print_live_ticker(price, now)
             time.sleep(self._render_interval_sec)
 
-    def _schedule_tick_work(self, price: float, now: datetime) -> None:
+    def _schedule_tick_work(self, price: float, snap_high: float, snap_low: float, now: datetime) -> None:
         start_worker = False
         with self._tick_work_lock:
-            self._pending_tick = (float(price), now)
+            if self._pending_tick is not None:
+                snap_high = max(float(snap_high), float(self._pending_tick.high))
+                snap_low = min(float(snap_low), float(self._pending_tick.low))
+            self._pending_tick = TickSnapshot(price=float(price), high=float(snap_high), low=float(snap_low), ts=now)
             if not self._tick_worker_running:
                 self._tick_worker_running = True
                 start_worker = True
@@ -190,48 +206,59 @@ class BtcEngine:
                     self._tick_worker_running = False
                 return
 
-            price, now = pending
-            self._process_tick_work(price, now)
+            self._process_tick_work(pending)
 
-    def _process_tick_work(self, price: float, now: datetime) -> None:
+    def _process_tick_work(self, snap: TickSnapshot) -> None:
+        price = float(snap.price)
+        snap_high = float(snap.high)
+        snap_low = float(snap.low)
+        now = snap.ts
         # 2. Check SL/TP using the latest known tick state.
-        open_df = self.journal.load_open_trades()
-        if not open_df.empty:
-            high = self._live_bar_high if self._live_bar_high is not None else price
-            low = self._live_bar_low if self._live_bar_low is not None else price
-            atr = self._latest_atr if self._latest_atr > 0 else float(open_df.iloc[-1].get("atr_at_entry", 0.0) or 0.0)
+        if self.shadow_mode.has_open_trades():
+            atr = self._latest_atr if self._latest_atr > 0 else self.shadow_mode.get_any_open_atr()
+            for tid, direction, sl in self.shadow_mode.open_trade_snapshots():
+                would_hit = (snap_low <= sl) if direction == 1 else (snap_high >= sl)
+                logger.debug(
+                    "sl_check trade_id=%s dir=%d snap_low=%.2f snap_high=%.2f sl=%.2f hit=%s",
+                    tid,
+                    direction,
+                    snap_low,
+                    snap_high,
+                    sl,
+                    would_hit,
+                )
             try:
                 closed_ids = self.shadow_mode.tick(
                     current_price=price,
-                    high=float(high),
-                    low=float(low),
+                    high=snap_high,
+                    low=snap_low,
                     atr=float(atr),
                     current_time=now,
                 )
                 if closed_ids:
                     self._send_exit_alerts(closed_ids)
             except Exception as e:
-                logger.debug("tick_sl_tp_error: %s", e)
+                logger.warning("tick_sl_tp_error open=%s err=%s", self.shadow_mode.open_trade_ids(), e)
 
         # 3. Detect new 1m candle boundary and run entry signal evaluation.
         candle_minute = int(now.timestamp()) // 60
         if candle_minute != self._last_candle_minute:
             self._last_candle_minute = candle_minute
-            if not self._poll_lock:
-                self._poll_lock = True
+            if self._poll_lock.acquire(blocking=False):
                 try:
                     self._poll()
                 except Exception as e:
                     logger.exception("poll_failed: %s", e)
                 finally:
-                    self._poll_lock = False
+                    self._poll_lock.release()
 
     def _print_live_ticker(self, price: float, now: datetime) -> None:
         now_ts = now.timestamp()
         summary_changed = self._last_eval_summary != self._last_rendered_eval_summary
         heartbeat_due = (now_ts - self._last_render_ts) >= self._render_heartbeat_sec
-        # Render immediately on new evaluation result; otherwise throttle noisy tick updates.
-        if not summary_changed and not heartbeat_due:
+        price_changed = price != self._prev_tick_price
+        # Render on new eval result, price movement, or heartbeat; otherwise suppress.
+        if not summary_changed and not heartbeat_due and not price_changed:
             return
 
         line = f"btc = {price:,.2f} | {self._last_eval_summary}"
@@ -302,6 +329,9 @@ class BtcEngine:
         if raw_1m.empty:
             logger.warning("poll_skipped: no_1m_candles")
             return
+        closed_1m = self._drop_incomplete_candles(raw_1m, tf_minutes=1)
+        if not closed_1m.empty:
+            self._check_sl_tp_on_closed_candle(closed_1m.iloc[-1])
 
         # 2. Build features for each TF.
         feat_1m = build_features(raw_1m)
@@ -414,8 +444,35 @@ class BtcEngine:
             f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
         )
 
+    def _check_sl_tp_on_closed_candle(self, candle_1m: pd.Series) -> None:
+        """Fallback defense: if tick path misses, use closed 1m high/low to enforce exits."""
+        if not self.shadow_mode.has_open_trades():
+            return
+        candle_high = float(candle_1m.get("high", 0.0) or 0.0)
+        candle_low = float(candle_1m.get("low", 0.0) or 0.0)
+        if candle_high <= 0 or candle_low <= 0:
+            return
+
+        atr = self._latest_atr if self._latest_atr > 0 else self.shadow_mode.get_any_open_atr()
+        now = datetime.now(UTC)
+        mid_price = (candle_high + candle_low) / 2.0
+        closed_ids = self.shadow_mode.tick(
+            current_price=float(mid_price),
+            high=float(candle_high),
+            low=float(candle_low),
+            atr=float(atr),
+            current_time=now,
+        )
+        if closed_ids:
+            self._sl_tp_candle_fallback_count += len(closed_ids)
+            logger.warning("sl_tp_candle_fallback_fired ids=%s total=%d", closed_ids, self._sl_tp_candle_fallback_count)
+            self._send_exit_alerts(closed_ids)
+
     def _bootstrap_from_history(self) -> None:
         """Warm up features from historical candles and evaluate immediately on startup."""
+        if not self._poll_lock.acquire(timeout=30):
+            logger.warning("bootstrap_skipped: could not acquire poll lock")
+            return
         try:
             self._poll()
             # Avoid duplicate immediate poll on the first tick in the same minute.
@@ -423,6 +480,8 @@ class BtcEngine:
             logger.info("bootstrap_ready: historical warmup complete")
         except Exception as e:
             logger.exception("bootstrap_failed: %s", e)
+        finally:
+            self._poll_lock.release()
 
     def _maybe_send_hourly_heartbeat(self, now: datetime):
         if now.minute != 0:
@@ -554,6 +613,7 @@ class BtcEngine:
             pnl_inr=float(r.get("pnl_inr", 0.0)) if pd.notna(r.get("pnl_inr")) else None,
             charges_usd=float(r.get("charges_usd", 0.0)) if pd.notna(r.get("charges_usd")) else None,
             model_version=str(r.get("model_version", self.model_version)),
+            charges_inr=float(r.get("charges_inr")) if pd.notna(r.get("charges_inr")) else (float(r.get("charges_usd", 0.0)) * USD_TO_INR if pd.notna(r.get("charges_usd")) else None),
         )
 
 

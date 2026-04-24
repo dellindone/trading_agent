@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import pickle
 from pathlib import Path
 
@@ -200,11 +201,12 @@ def walk_forward_train(df, n_splits=5) -> dict:
     }
 
 
-def select_best_ema_pair(df: pd.DataFrame, n_splits: int = 5) -> tuple[tuple[int, int], list[dict]]:
+def select_best_ema_pair(df: pd.DataFrame, n_splits: int = 5) -> tuple[tuple[int, int], list[dict], dict]:
     """Pick EMA fast/slow pair by walk-forward directional accuracy."""
     search_reports: list[dict] = []
     best_pair = (8, 21)
     best_score = -1.0
+    best_result: dict | None = None
 
     for fast, slow in EMA_PAIR_CANDIDATES:
         tuned = apply_ema_pair_features(df.copy(), ema_fast=fast, ema_slow=slow)
@@ -214,8 +216,12 @@ def select_best_ema_pair(df: pd.DataFrame, n_splits: int = 5) -> tuple[tuple[int
         if score > best_score:
             best_score = score
             best_pair = (int(fast), int(slow))
+            best_result = result
 
-    return best_pair, search_reports
+    if best_result is None:
+        tuned = apply_ema_pair_features(df.copy(), ema_fast=best_pair[0], ema_slow=best_pair[1])
+        best_result = walk_forward_train(tuned, n_splits=n_splits)
+    return best_pair, search_reports, best_result
 
 
 def train_final_model(df, feature_cols, label_map) -> lgb.LGBMClassifier:
@@ -274,7 +280,7 @@ def save_model(result, final_model, ema_fast: int = 8, ema_slow: int = 21, ema_s
         json.dump(meta, f, indent=2)
 
 
-def run_training(n_splits: int = 5) -> None:
+def run_training(n_splits: int = 5, force_ema_search: bool = False) -> None:
     """Convenience full training flow using local BTC processed parquet."""
     path_1m = PROC_DIR / "BTCUSDT_1m_labeled.parquet"
     if not path_1m.exists():
@@ -282,15 +288,34 @@ def run_training(n_splits: int = 5) -> None:
 
     df = pd.read_parquet(path_1m)
     df = merge_htf(df, "15m")
+    df = merge_htf(df, "45m")
     df = merge_htf(df, "1h")
-    best_pair, ema_search_reports = select_best_ema_pair(df, n_splits=n_splits)
+    meta_path = MODEL_DIR / "model_meta.json"
+    best_pair: tuple[int, int] | None = None
+    if not force_ema_search and meta_path.exists():
+        try:
+            with meta_path.open("r") as f:
+                cached = json.load(f)
+            if "ema_fast" in cached and "ema_slow" in cached:
+                best_pair = (int(cached["ema_fast"]), int(cached["ema_slow"]))
+        except Exception:
+            best_pair = None
+
+    if best_pair is None:
+        best_pair, ema_search_reports, best_result = select_best_ema_pair(df, n_splits=n_splits)
+    else:
+        ema_search_reports = []
+        tuned = apply_ema_pair_features(df.copy(), ema_fast=best_pair[0], ema_slow=best_pair[1])
+        best_result = walk_forward_train(tuned, n_splits=n_splits)
+
     ema_fast, ema_slow = best_pair
     tuned_df = apply_ema_pair_features(df.copy(), ema_fast=ema_fast, ema_slow=ema_slow)
 
-    result = walk_forward_train(tuned_df, n_splits=n_splits)
+    result = best_result
     final_model = train_final_model(tuned_df, result["feature_cols"], result["label_map"])
     save_model(result, final_model, ema_fast=ema_fast, ema_slow=ema_slow, ema_search_reports=ema_search_reports)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run_training(n_splits=5)

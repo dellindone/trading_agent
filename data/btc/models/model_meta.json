@@ -81,40 +81,76 @@
     "0": -1,
     "1": 1
   },
-  "best_dir_accuracy": 0.727760519627224,
+  "best_dir_accuracy": 0.6679383919740003,
   "walk_forward_reports": [
     {
       "fold": 1,
-      "dir_accuracy": 0.7050861946146174,
-      "train_size": 14243,
-      "test_size": 14038
+      "dir_accuracy": 0.6595684068086318,
+      "train_size": 14253,
+      "test_size": 14041
     },
     {
       "fold": 2,
-      "dir_accuracy": 0.7164977879263593,
-      "train_size": 28281,
-      "test_size": 14014
+      "dir_accuracy": 0.6626256863723882,
+      "train_size": 28294,
+      "test_size": 14023
     },
     {
       "fold": 3,
-      "dir_accuracy": 0.7200256465056636,
-      "train_size": 42295,
-      "test_size": 14037
+      "dir_accuracy": 0.6507473309608541,
+      "train_size": 42317,
+      "test_size": 14050
     },
     {
       "fold": 4,
-      "dir_accuracy": 0.714429361488185,
-      "train_size": 56332,
-      "test_size": 13923
+      "dir_accuracy": 0.666523174056536,
+      "train_size": 56367,
+      "test_size": 13938
     },
     {
       "fold": 5,
-      "dir_accuracy": 0.727760519627224,
-      "train_size": 70255,
-      "test_size": 14164
+      "dir_accuracy": 0.6679383919740003,
+      "train_size": 70305,
+      "test_size": 14154
     }
   ],
   "ema_fast": 8,
   "ema_slow": 21,
-  "ema_search_reports": []
+  "ema_search_reports": [
+    {
+      "ema_fast": 5,
+      "ema_slow": 15,
+      "best_dir_accuracy": 0.6675144835382224
+    },
+    {
+      "ema_fast": 5,
+      "ema_slow": 13,
+      "best_dir_accuracy": 0.6673731807262965
+    },
+    {
+      "ema_fast": 8,
+      "ema_slow": 21,
+      "best_dir_accuracy": 0.6679383919740003
+    },
+    {
+      "ema_fast": 9,
+      "ema_slow": 15,
+      "best_dir_accuracy": 0.6673025293203335
+    },
+    {
+      "ema_fast": 9,
+      "ema_slow": 21,
+      "best_dir_accuracy": 0.6675851349441854
+    },
+    {
+      "ema_fast": 10,
+      "ema_slow": 30,
+      "best_dir_accuracy": 0.6675851349441854
+    },
+    {
+      "ema_fast": 12,
+      "ema_slow": 26,
+      "best_dir_accuracy": 0.6664547124487777
+    }
+  ]
 }

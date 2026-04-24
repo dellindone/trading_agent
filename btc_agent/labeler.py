@@ -7,7 +7,7 @@ import pandas as pd
 
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 3.0
-FORWARD_BARS = 60
+FORWARD_BARS = 180
 
 
 def apply_ema_pair_features(df: pd.DataFrame, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataFrame:
@@ -116,6 +116,8 @@ def label_trades(
     sl_mult: float = SL_ATR_MULT,
     tp_mult: float = TP_ATR_MULT,
     forward_bars: int = FORWARD_BARS,
+    ema_fast: int = 8,
+    ema_slow: int = 21,
 ) -> pd.DataFrame:
     """Forward-simulate labeled outcomes for signaled bars only.
 
@@ -123,7 +125,7 @@ def label_trades(
       +1 => TP hit before SL (win)
       -1 => SL hit first OR timeout/no-hit within forward window (loss)
     """
-    frame = compute_entry_signals(df.copy())
+    frame = compute_entry_signals(df.copy(), ema_fast=ema_fast, ema_slow=ema_slow)
 
     n = len(frame)
     labels = np.zeros(n, dtype=int)
