@@ -1,8 +1,20 @@
+.venv/
+.env
+.env.*
+!.env.template
+data/
+*.parquet
+*.csv
+*.joblib
+.fyers_token
+logs/
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.vscode/
+.DS_Store
+core/model/artifacts/*.joblib
 # Added by code-review-graph
 .code-review-graph/
-*.pdf
-.claude
-.venv
-*.log
-*.parquet
-*.pyc

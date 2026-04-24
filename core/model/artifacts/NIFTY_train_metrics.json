@@ -1,0 +1,50 @@
+{
+  "instrument": "NIFTY",
+  "direction_accuracy": 0.6862037871956718,
+  "direction_f1": 0.6860921760875056,
+  "phase1_target_mae": 10.0441564876933,
+  "walk_forward": {
+    "n_folds": 5,
+    "mean_accuracy": 0.6457014707463204,
+    "std_accuracy": 0.043354369304696765,
+    "mean_f1": 0.6429415079198982,
+    "std_f1": 0.045360143840347276,
+    "folds": [
+      {
+        "fold": 1,
+        "train_size": 500,
+        "val_size": 14685,
+        "direction_accuracy": 0.5705822267620021,
+        "direction_f1": 0.5681041765049523
+      },
+      {
+        "fold": 2,
+        "train_size": 15185,
+        "val_size": 14685,
+        "direction_accuracy": 0.6232209737827715,
+        "direction_f1": 0.61254625187166
+      },
+      {
+        "fold": 3,
+        "train_size": 29870,
+        "val_size": 14685,
+        "direction_accuracy": 0.6726591760299625,
+        "direction_f1": 0.6725871097945013
+      },
+      {
+        "fold": 4,
+        "train_size": 44555,
+        "val_size": 14685,
+        "direction_accuracy": 0.6772897514470548,
+        "direction_f1": 0.6770162928172887
+      },
+      {
+        "fold": 5,
+        "train_size": 59240,
+        "val_size": 14687,
+        "direction_accuracy": 0.6847552257098114,
+        "direction_f1": 0.6844537086110885
+      }
+    ]
+  }
+}
