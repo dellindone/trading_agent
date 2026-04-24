@@ -37,12 +37,11 @@ BTC_CONTRACT   = 0.001     # minimum position increment (0.001 BTC)
 
 class BtcSignalHandler:
     MIN_CONFIDENCE  = 0.55
-    RISK_PCT        = 0.02   # risk 2% of capital per trade
+    RISK_PCT        = 0.01   # risk 1% of capital per trade
     SL_ATR_MULT     = 1.5
     TP_ATR_MULT     = 3.0
-    MIN_RR          = 1.5
     MAX_FEE_PCT_OF_TP = 0.30
-    MAX_LEVERAGE    = 2.0    # 200% = 2x — keeps margin safe on small capital
+    MAX_LEVERAGE    = 10.0   # 1000% = 10x leverage cap
     REVERSAL_SIZE_MULT = 0.50
     REVERSAL_MIN_CONFIDENCE = 0.60
 
@@ -61,11 +60,12 @@ class BtcSignalHandler:
         self.reverse_map = {int(k): int(v) for k, v in (meta.get("reverse_map") or {}).items()}
         self.ema_fast = int(meta.get("ema_fast", 8) or 8)
         self.ema_slow = int(meta.get("ema_slow", 21) or 21)
+        self.MIN_CONFIDENCE = float(meta.get("best_threshold", self.MIN_CONFIDENCE) or self.MIN_CONFIDENCE)
         usd_to_inr = float(os.getenv("BTC_USD_INR", "83.0"))
         self.INR_TO_USD = (1.0 / usd_to_inr) if usd_to_inr > 0 else 0.012
         self.last_rejection_reason = "NOT_EVALUATED"
 
-    def _reject(self, reason: str) -> None:
+    def _reject(self, reason: str) -> BtcTradeSignal | None:
         self.last_rejection_reason = str(reason)
         return None
 
@@ -127,14 +127,6 @@ class BtcSignalHandler:
         if sl_dist <= 0:
             return self._reject("SL_DISTANCE_INVALID")
 
-        rr = tp_dist / sl_dist
-        if rr < self.MIN_RR:
-            return self._reject(f"RR_TOO_LOW({rr:.2f}<{self.MIN_RR:.2f})")
-
-        sl_distance_pct = sl_dist / current_price
-        if sl_distance_pct <= 0:
-            return self._reject("SL_DISTANCE_PCT_INVALID")
-
         # Fee viability: gross TP profit must cover at least (1 / MAX_FEE_PCT_OF_TP) x fees.
         # tp_pct = TP move as % of price; fee is 0.1% of notional.
         # Minimum tp_pct required = ROUND_TRIP_FEE / MAX_FEE_PCT_OF_TP = 0.1% / 0.30 = 0.33%
@@ -151,7 +143,7 @@ class BtcSignalHandler:
         raw_btc = risk_usd / sl_dist  # BTC needed to lose exactly risk_usd on SL hit
         # Round down to nearest 0.001 BTC increment, enforce minimum.
         contracts = max(BTC_CONTRACT, int(raw_btc / BTC_CONTRACT) * BTC_CONTRACT)
-        # Cap at 2x leverage: notional = contracts * price <= capital_usd * MAX_LEVERAGE.
+        # Cap at MAX_LEVERAGE: notional = contracts * price <= capital_usd * MAX_LEVERAGE.
         max_btc = (capital_usd * self.MAX_LEVERAGE) / current_price
         max_btc_rounded = int(max_btc / BTC_CONTRACT) * BTC_CONTRACT
         contracts = min(contracts, max(BTC_CONTRACT, max_btc_rounded))
