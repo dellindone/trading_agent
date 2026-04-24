@@ -9,10 +9,22 @@ from pathlib import Path
 import lightgbm as lgb
 import pandas as pd
 
+from btc_agent.labeler import apply_ema_pair_features
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "btc"
 PROC_DIR = DATA_DIR / "processed"
 MODEL_DIR = DATA_DIR / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+EMA_PAIR_CANDIDATES = [
+    (5, 15),
+    (5, 13),
+    (8, 21),
+    (9, 15),
+    (9, 21),
+    (10, 30),
+    (12, 26),
+]
 
 BASE_FEATURES = [
     "close_vs_ema8", "close_vs_ema21", "close_vs_sma50", "close_vs_sma200",
@@ -188,6 +200,24 @@ def walk_forward_train(df, n_splits=5) -> dict:
     }
 
 
+def select_best_ema_pair(df: pd.DataFrame, n_splits: int = 5) -> tuple[tuple[int, int], list[dict]]:
+    """Pick EMA fast/slow pair by walk-forward directional accuracy."""
+    search_reports: list[dict] = []
+    best_pair = (8, 21)
+    best_score = -1.0
+
+    for fast, slow in EMA_PAIR_CANDIDATES:
+        tuned = apply_ema_pair_features(df.copy(), ema_fast=fast, ema_slow=slow)
+        result = walk_forward_train(tuned, n_splits=n_splits)
+        score = float(result.get("best_dir_accuracy", 0.0) or 0.0)
+        search_reports.append({"ema_fast": int(fast), "ema_slow": int(slow), "best_dir_accuracy": score})
+        if score > best_score:
+            best_score = score
+            best_pair = (int(fast), int(slow))
+
+    return best_pair, search_reports
+
+
 def train_final_model(df, feature_cols, label_map) -> lgb.LGBMClassifier:
     """Train LightGBM on full dataset with n_estimators=1000."""
     X = df[feature_cols].copy()
@@ -222,7 +252,7 @@ def train_final_model(df, feature_cols, label_map) -> lgb.LGBMClassifier:
     return model
 
 
-def save_model(result, final_model):
+def save_model(result, final_model, ema_fast: int = 8, ema_slow: int = 21, ema_search_reports: list[dict] | None = None):
     """Save model pickle and metadata json to MODEL_DIR."""
     model_path = MODEL_DIR / "lgbm_signal_model.pkl"
     meta_path = MODEL_DIR / "model_meta.json"
@@ -236,6 +266,9 @@ def save_model(result, final_model):
         "reverse_map": {str(k): v for k, v in result["reverse_map"].items()},
         "best_dir_accuracy": result["best_dir_accuracy"],
         "walk_forward_reports": result["reports"],
+        "ema_fast": int(ema_fast),
+        "ema_slow": int(ema_slow),
+        "ema_search_reports": ema_search_reports or [],
     }
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
@@ -250,10 +283,13 @@ def run_training(n_splits: int = 5) -> None:
     df = pd.read_parquet(path_1m)
     df = merge_htf(df, "15m")
     df = merge_htf(df, "1h")
+    best_pair, ema_search_reports = select_best_ema_pair(df, n_splits=n_splits)
+    ema_fast, ema_slow = best_pair
+    tuned_df = apply_ema_pair_features(df.copy(), ema_fast=ema_fast, ema_slow=ema_slow)
 
-    result = walk_forward_train(df, n_splits=n_splits)
-    final_model = train_final_model(df, result["feature_cols"], result["label_map"])
-    save_model(result, final_model)
+    result = walk_forward_train(tuned_df, n_splits=n_splits)
+    final_model = train_final_model(tuned_df, result["feature_cols"], result["label_map"])
+    save_model(result, final_model, ema_fast=ema_fast, ema_slow=ema_slow, ema_search_reports=ema_search_reports)
 
 
 if __name__ == "__main__":

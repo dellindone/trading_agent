@@ -57,6 +57,8 @@ class BtcSignalHandler:
 
         self.feature_cols = [str(c) for c in meta.get("feature_cols", [])]
         self.reverse_map = {int(k): int(v) for k, v in (meta.get("reverse_map") or {}).items()}
+        self.ema_fast = int(meta.get("ema_fast", 8) or 8)
+        self.ema_slow = int(meta.get("ema_slow", 21) or 21)
         self.last_rejection_reason = "NOT_EVALUATED"
 
     def _reject(self, reason: str) -> None:

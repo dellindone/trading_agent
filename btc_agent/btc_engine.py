@@ -318,7 +318,11 @@ class BtcEngine:
         merged = self._merge_htf_context(merged, feat_45m, "45m")
 
         # 4. Compute confluence entry signals.
-        merged = compute_entry_signals(merged)
+        merged = compute_entry_signals(
+            merged,
+            ema_fast=int(self.signal_handler.ema_fast),
+            ema_slow=int(self.signal_handler.ema_slow),
+        )
         if merged.empty:
             logger.warning("poll_skipped: empty_merged_frame")
             return
@@ -406,6 +410,7 @@ class BtcEngine:
             f"bull_score={bull_score}/11 bear_score={bear_score}/11 rsi={rsi:.1f} "
             f"atr_15m={atr_15m:.0f} htf_15m={htf_trend_15m:+d} htf_45m={htf_trend_45m:+d} "
             f"htf_gate={htf_trend:+d}({htf_gate_tf}) htf_source={htf_source} "
+            f"ema_pair={int(self.signal_handler.ema_fast)}/{int(self.signal_handler.ema_slow)} "
             f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
         )
 

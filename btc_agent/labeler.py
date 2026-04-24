@@ -10,9 +10,28 @@ TP_ATR_MULT = 3.0
 FORWARD_BARS = 60
 
 
-def compute_entry_signals(df) -> pd.DataFrame:
-    """Compute bullish/bearish confluence scores and binary entry flags."""
+def apply_ema_pair_features(df: pd.DataFrame, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataFrame:
+    """Recompute EMA-derived confluence/model features for the selected pair."""
     frame = df.copy()
+    fast = max(2, int(ema_fast))
+    slow = max(fast + 1, int(ema_slow))
+
+    frame["ema_8"] = frame["close"].ewm(span=fast, adjust=False).mean()
+    frame["ema_21"] = frame["close"].ewm(span=slow, adjust=False).mean()
+
+    atr = pd.to_numeric(frame.get("atr_14"), errors="coerce")
+    if atr is not None:
+        denom = atr.replace(0, np.nan)
+        frame["close_vs_ema8"] = (frame["close"] - frame["ema_8"]) / denom
+        frame["close_vs_ema21"] = (frame["close"] - frame["ema_21"]) / denom
+        frame["ema8_vs_ema21"] = (frame["ema_8"] - frame["ema_21"]) / denom
+
+    return frame
+
+
+def compute_entry_signals(df, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataFrame:
+    """Compute bullish/bearish confluence scores and binary entry flags."""
+    frame = apply_ema_pair_features(df.copy(), ema_fast=ema_fast, ema_slow=ema_slow)
 
     bull_score = pd.Series(0, index=frame.index)
     bull_score += (frame["bull_bos"] == 1).astype(int)

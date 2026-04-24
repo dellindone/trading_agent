@@ -81,37 +81,40 @@
     "0": -1,
     "1": 1
   },
-  "best_dir_accuracy": 0.7282156212516757,
+  "best_dir_accuracy": 0.727760519627224,
   "walk_forward_reports": [
     {
       "fold": 1,
-      "dir_accuracy": 0.7048025613660619,
-      "train_size": 14214,
-      "test_size": 14055
+      "dir_accuracy": 0.7050861946146174,
+      "train_size": 14243,
+      "test_size": 14038
     },
     {
       "fold": 2,
-      "dir_accuracy": 0.7217503033764009,
-      "train_size": 28269,
-      "test_size": 14009
+      "dir_accuracy": 0.7164977879263593,
+      "train_size": 28281,
+      "test_size": 14014
     },
     {
       "fold": 3,
-      "dir_accuracy": 0.7154784842646115,
-      "train_size": 42278,
-      "test_size": 14013
+      "dir_accuracy": 0.7200256465056636,
+      "train_size": 42295,
+      "test_size": 14037
     },
     {
       "fold": 4,
-      "dir_accuracy": 0.717410071942446,
-      "train_size": 56291,
-      "test_size": 13900
+      "dir_accuracy": 0.714429361488185,
+      "train_size": 56332,
+      "test_size": 13923
     },
     {
       "fold": 5,
-      "dir_accuracy": 0.7282156212516757,
-      "train_size": 70191,
-      "test_size": 14173
+      "dir_accuracy": 0.727760519627224,
+      "train_size": 70255,
+      "test_size": 14164
     }
-  ]
+  ],
+  "ema_fast": 8,
+  "ema_slow": 21,
+  "ema_search_reports": []
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,13 +10,21 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-BINANCE_BASE = "https://api.binance.com"
+logger = logging.getLogger(__name__)
+
+BINANCE_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
 DELTA_BASE = "https://api.delta.exchange"
 SYMBOL_BINANCE = "BTCUSDT"
 SYMBOL_DELTA = "BTCUSDT"
 TIMEFRAMES = ["1m", "15m", "1h", "4h", "1d"]
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "btc" / "raw"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+_BINANCE_SESSION = requests.Session()
 
 _INTERVAL_SECONDS = {
     "1m": 60,
@@ -28,7 +37,6 @@ _INTERVAL_SECONDS = {
 
 def fetch_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """Paginated Binance OHLCV fetch (1000 candles/request)."""
-    url = f"{BINANCE_BASE}/api/v3/klines"
     all_rows: list[list] = []
     cursor = int(start_ms)
 
@@ -40,9 +48,42 @@ def fetch_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int)
             "endTime": int(end_ms),
             "limit": 1000,
         }
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
-        rows = response.json()
+        rows = None
+        errors: list[str] = []
+        for attempt in range(1, 7):
+            for base in BINANCE_BASES:
+                url = f"{base}/api/v3/klines"
+                try:
+                    response = _BINANCE_SESSION.get(url, params=params, timeout=20)
+                    # Retry on exchange throttling / transient server errors.
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        raise requests.HTTPError(
+                            f"{response.status_code} from {base}",
+                            response=response,
+                        )
+                    response.raise_for_status()
+                    rows = response.json()
+                    break
+                except requests.RequestException as exc:
+                    errors.append(f"{base}: {exc.__class__.__name__}")
+            if rows is not None:
+                break
+            sleep_s = min(2.0 * attempt, 12.0)
+            logger.warning(
+                "binance_fetch_retry symbol=%s tf=%s cursor=%s attempt=%d sleep=%.1fs",
+                symbol,
+                interval,
+                cursor,
+                attempt,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+
+        if rows is None:
+            raise RuntimeError(
+                f"Binance klines fetch failed after retries symbol={symbol} interval={interval} "
+                f"cursor={cursor} sample_errors={errors[:4]}"
+            )
 
         if not rows:
             break
