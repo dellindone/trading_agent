@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import talib
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,11 @@ from core.features.candlestick import compute_candlestick_features  # noqa: E402
 
 def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema_8"]   = df["close"].ewm(span=8,   adjust=False).mean()
-    df["ema_21"]  = df["close"].ewm(span=21,  adjust=False).mean()
-    df["sma_50"]  = df["close"].rolling(50).mean()
-    df["sma_200"] = df["close"].rolling(200).mean()
+    c = df["close"].to_numpy(dtype=float)
+    df["ema_8"]   = talib.EMA(c, timeperiod=8)
+    df["ema_21"]  = talib.EMA(c, timeperiod=21)
+    df["sma_50"]  = talib.SMA(c, timeperiod=50)
+    df["sma_200"] = talib.SMA(c, timeperiod=200)
     return df
 
 
@@ -603,40 +605,37 @@ def add_funding_oi(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"]
-    low  = df["low"]
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
+    result = talib.ATR(
+        df["high"].to_numpy(dtype=float),
+        df["low"].to_numpy(dtype=float),
+        df["close"].to_numpy(dtype=float),
+        timeperiod=period,
+    )
+    return pd.Series(result, index=df.index)
 
 
 def add_standard_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    high  = df["high"].to_numpy(dtype=float)
+    low   = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    vol   = df["volume"].to_numpy(dtype=float)
 
-    # ATR
-    df["atr_14"] = compute_atr(df, 14)
+    # ATR — Wilder's smoothing, matches TradingView / Delta Exchange exactly
+    df["atr_14"] = talib.ATR(high, low, close, timeperiod=14)
 
-    # RSI
-    delta  = df["close"].diff()
-    gain   = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
-    loss   = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
-    rs     = gain / loss.replace(0, np.nan)
-    df["rsi_14"] = 100 - (100 / (1 + rs))
+    # RSI — Wilder's RMA, same standard
+    df["rsi_14"] = talib.RSI(close, timeperiod=14)
 
     # MACD
-    ema12  = df["close"].ewm(span=12, adjust=False).mean()
-    ema26  = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"]        = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"]   = df["macd"] - df["macd_signal"]
+    macd, macd_sig, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    df["macd"]        = macd
+    df["macd_signal"] = macd_sig
+    df["macd_hist"]   = macd_hist
 
     # Volume features
-    df["volume_sma_20"] = df["volume"].rolling(20).mean()
-    df["volume_ratio"]  = df["volume"] / df["volume_sma_20"]
+    df["volume_sma_20"] = talib.SMA(vol, timeperiod=20)
+    df["volume_ratio"]  = vol / np.where(df["volume_sma_20"] > 0, df["volume_sma_20"], np.nan)
 
     # Candle features
     df["body_size"]     = (df["close"] - df["open"]).abs() / df["atr_14"]

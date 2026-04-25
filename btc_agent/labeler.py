@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import talib
 
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 3.0
@@ -16,8 +17,9 @@ def apply_ema_pair_features(df: pd.DataFrame, ema_fast: int = 8, ema_slow: int =
     fast = max(2, int(ema_fast))
     slow = max(fast + 1, int(ema_slow))
 
-    frame["ema_8"] = frame["close"].ewm(span=fast, adjust=False).mean()
-    frame["ema_21"] = frame["close"].ewm(span=slow, adjust=False).mean()
+    c = frame["close"].to_numpy(dtype=float)
+    frame["ema_8"]  = talib.EMA(c, timeperiod=fast)
+    frame["ema_21"] = talib.EMA(c, timeperiod=slow)
 
     atr = pd.to_numeric(frame.get("atr_14"), errors="coerce")
     if atr is not None:

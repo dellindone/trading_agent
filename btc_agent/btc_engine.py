@@ -129,13 +129,20 @@ class BtcEngine:
             time.sleep(1.0)
 
     def _get_candles(self, tf: str, bars: int = 350) -> pd.DataFrame:
-        """Return OHLCV candles: tick-built when buffer is warm, REST otherwise."""
-        agg = self.delta_client.tick_aggregator
-        if agg.has_enough_history(tf, min_bars=bars):
-            candles = agg.get_candles(tf, bars=bars)
-            if not candles.empty:
-                logger.debug("candles_source=tick tf=%s bars=%d", tf, len(candles))
-                return candles
+        """Return OHLCV candles.
+
+        1m always uses REST — tick-aggregated 1m bars have gaps for quiet periods
+        (no trades → bar dropped), which shifts RSI/MACD away from exchange values.
+        HTF (15m+) uses tick-built candles when warm; gaps are negligible at those
+        resolutions. Falls back to REST if tick buffer is not ready.
+        """
+        if tf != "1m":
+            agg = self.delta_client.tick_aggregator
+            if agg.has_enough_history(tf, min_bars=bars):
+                candles = agg.get_candles(tf, bars=bars)
+                if not candles.empty:
+                    logger.debug("candles_source=tick tf=%s bars=%d", tf, len(candles))
+                    return candles
         logger.debug("candles_source=rest tf=%s", tf)
         return self.delta_client.get_ohlcv(tf, bars=bars)
 
@@ -351,8 +358,12 @@ class BtcEngine:
         if not closed_1m.empty:
             self._check_sl_tp_on_closed_candle(closed_1m.iloc[-1])
 
-        # 2. Build features for each TF.
-        feat_1m  = self._get_features(raw_1m,  "1m")
+        # 2. Build features on CLOSED bars only so indicators match Delta Exchange UI.
+        # The current partial bar is excluded — its RSI/MACD would reflect only
+        # 1-2 ticks and diverge wildly from the last closed bar seen on the chart.
+        # Entry price is always fetched live from get_btc_price() so execution
+        # price is unaffected by this change.
+        feat_1m  = self._get_features(closed_1m, "1m")
         feat_15m = self._get_features(raw_15m, "15m")
         feat_1h  = self._get_features(raw_1h,  "1h")
         feat_45m = self._get_features(raw_45m, "45m")
@@ -401,8 +412,10 @@ class BtcEngine:
         htf_gate_tf = "45m" if has_45m_context else "15m"
         htf_trend = htf_trend_45m if htf_gate_tf == "45m" else htf_trend_15m
         htf_source = "45m_primary" if has_45m_context else "15m_fallback(no_45m_features)"
-        atr_15m      = float(last.get("15m_atr_14", 0.0) or 0.0)
-        rsi          = float(last.get("rsi_14", 0.0) or 0.0)
+        atr_15m = float(last.get("15m_atr_14", 0.0) or 0.0)
+        rsi_1m  = float(last.get("rsi_14", 0.0) or 0.0)
+        rsi_45m = float(last.get("45m_rsi_14", 0.0) or 0.0)
+        rsi_15m = float(last.get("15m_rsi_14", 0.0) or 0.0)
 
         open_trades = int(len(self.journal.load_open_trades()))
 
@@ -465,9 +478,10 @@ class BtcEngine:
             outcome = f"skip: MODEL_REJECT ({rejection_reason})"
 
         self._last_eval_summary = (
-            f"bull_score={bull_score}/11 bear_score={bear_score}/11 rsi={rsi:.1f} "
+            f"bull_score={bull_score}/11 bear_score={bear_score}/11 "
+            f"rsi_1m={rsi_1m:.1f} rsi_15m={rsi_15m:.1f} rsi_45m={rsi_45m:.1f} "
             f"atr_15m={atr_15m:.0f} htf_15m={htf_trend_15m:+d} htf_45m={htf_trend_45m:+d} "
-            f"htf_gate={htf_trend:+d}({htf_gate_tf}) htf_source={htf_source} "
+            f"htf_gate={htf_trend:+d}({htf_gate_tf}) "
             f"ema_pair={int(self.signal_handler.ema_fast)}/{int(self.signal_handler.ema_slow)} "
             f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
             f" regime={self.signal_handler.last_regime}"

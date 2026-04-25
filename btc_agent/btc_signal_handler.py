@@ -137,7 +137,14 @@ class BtcSignalHandler:
         direction = 1 if long_signal == 1 else -1
         if open_trades >= max_concurrent:
             return self._reject(f"MAX_CONCURRENT({open_trades}>={max_concurrent})")
-        rsi = float(row.get("rsi_14", 50.0) or 50.0)
+        # Use HTF RSI (45m preferred, 15m fallback, 1m last resort).
+        # 1m RSI spikes to 80-90 on any strong momentum candle — not meaningful for a filter.
+        rsi = float(
+            row.get("45m_rsi_14")
+            or row.get("15m_rsi_14")
+            or row.get("rsi_14")
+            or 50.0
+        )
         if direction == 1 and rsi > 80:
             return self._reject(f"RSI_OVERBOUGHT({rsi:.1f})")
         if direction == -1 and rsi < 20:
