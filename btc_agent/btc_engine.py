@@ -65,6 +65,7 @@ class BtcEngine:
         self.delta_client = delta_client
         self.signal_handler = BtcSignalHandler()
         self.journal = BtcJournal(data_dir=data_dir)
+        self.signal_handler.rebuild_override_fuses(self.journal.load_closed_override_events(lookback_days=7))
         self.capital_tracker = CapitalTracker(data_dir=data_dir, initial_capital=self.capital_inr)
         self.shadow_mode = BtcShadowMode(journal=self.journal, capital_tracker=self.capital_tracker)
         self.shadow_mode.model_version = self.model_version
@@ -503,6 +504,7 @@ class BtcEngine:
         bear_score   = int(last.get("bear_score", 0) or 0)
         long_signal  = int(last.get("long_signal", 0) or 0)
         short_signal = int(last.get("short_signal", 0) or 0)
+        override_candidate = bool(last.get("override", 0) or 0)
         htf_trend_15m = int(last.get("15m_smc_trend", 0) or 0)
         htf_trend_45m = int(last.get("45m_smc_trend", 0) or 0)
         has_45m_context = "45m_smc_trend" in merged.columns
@@ -522,6 +524,7 @@ class BtcEngine:
             current_price=current_price,
             capital_inr=float(self.capital_tracker.current_capital),
             open_trades=open_trades,
+            override=override_candidate,
         )
         rejection_reason = self.signal_handler.last_rejection_reason
         drift_alerts = self.signal_handler.last_drift_alerts
@@ -534,6 +537,11 @@ class BtcEngine:
             trade = self.shadow_mode.enter_trade(signal)
             if trade is not None:
                 self.reporter.send_signal_alert(signal)
+        if self.signal_handler.last_override_reached_model:
+            self.signal_handler.note_override_result(
+                executed=(signal is not None and trade is not None),
+                model_rejected=(signal is None),
+            )
 
         # 9. Cache ATR (prefer 15m ATR for meaningful SL distances) for live tick management.
         atr = float(last.get("15m_atr_14", 0.0) or last.get("atr_14", 0.0) or 0.0)
@@ -612,6 +620,7 @@ class BtcEngine:
             "ema_slow": int(self.signal_handler.ema_slow),
             "long_signal": long_signal,
             "short_signal": short_signal,
+            "override_candidate": int(override_candidate),
             "outcome_code": outcome_code,
             "regime": self.signal_handler.last_regime or "?",
             "open_trades": open_trades,
@@ -704,6 +713,9 @@ class BtcEngine:
 
     def _send_exit_alerts(self, closed_ids: list[str]) -> None:
         for trade_id in closed_ids:
+            override_event = self.journal.get_closed_override_event(trade_id)
+            if override_event is not None:
+                self.signal_handler.ingest_override_realized_r(override_event[0], override_event[1])
             record = self._get_record(trade_id)
             if record is not None:
                 self.reporter.send_exit_alert(record, capital_inr=float(self.capital_tracker.current_capital))
@@ -790,6 +802,7 @@ class BtcEngine:
             pnl_inr=float(r.get("pnl_inr", 0.0)) if pd.notna(r.get("pnl_inr")) else None,
             charges_usd=float(r.get("charges_usd", 0.0)) if pd.notna(r.get("charges_usd")) else None,
             model_version=str(r.get("model_version", self.model_version)),
+            override=bool(r.get("override", False) or False),
             charges_inr=float(r.get("charges_inr")) if pd.notna(r.get("charges_inr")) else (float(r.get("charges_usd", 0.0)) * USD_TO_INR if pd.notna(r.get("charges_usd")) else None),
         )
 

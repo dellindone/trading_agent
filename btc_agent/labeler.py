@@ -76,9 +76,13 @@ def compute_entry_signals(df, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataF
     # Longs require HTF trend to be not bearish; shorts require not bullish.
     htf_bull_ok = pd.Series(True, index=frame.index)
     htf_bear_ok = pd.Series(True, index=frame.index)
+    override_long_unlocked = pd.Series(False, index=frame.index)
+    override_short_unlocked = pd.Series(False, index=frame.index)
     if "45m_smc_trend" in frame.columns:
         htf_bull_ok &= (frame["45m_smc_trend"] >= 0)   # not -1 (bearish)
         htf_bear_ok &= (frame["45m_smc_trend"] <= 0)   # not +1 (bullish)
+        htf_bull_ok_base = htf_bull_ok.copy()
+        htf_bear_ok_base = htf_bear_ok.copy()
 
         # Stale-structure invalidation (shadow-toggle: set to True to activate).
         # Only relaxes the gate when BOTH: 15m structure has flipped, AND 45m
@@ -106,6 +110,8 @@ def compute_entry_signals(df, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataF
             )
             htf_bull_ok |= bull_structure_override
             htf_bear_ok |= bear_structure_override
+            override_long_unlocked = (~htf_bull_ok_base) & bull_structure_override
+            override_short_unlocked = (~htf_bear_ok_base) & bear_structure_override
 
     elif "15m_smc_trend" in frame.columns:
         htf_bull_ok &= (frame["15m_smc_trend"] >= 0)   # not -1 (bearish)
@@ -141,6 +147,10 @@ def compute_entry_signals(df, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataF
     frame["trend_short_signal"] = trend_short_signal.astype(int)
     frame["reversal_long_signal"] = reversal_long_signal.astype(int)
     frame["reversal_short_signal"] = reversal_short_signal.astype(int)
+    frame["override"] = (
+        (trend_long_signal & override_long_unlocked)
+        | (trend_short_signal & override_short_unlocked)
+    ).astype(int)
 
     frame["long_signal"] = trend_long_signal.astype(int)
     frame["short_signal"] = trend_short_signal.astype(int)

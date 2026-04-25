@@ -6,7 +6,7 @@ import logging
 import os
 from datetime import date, datetime
 
-from sqlalchemy import Column, Date, DateTime, Float, Integer, MetaData, Table, Text, create_engine
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, Integer, MetaData, Table, Text, create_engine, inspect, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 
@@ -51,6 +51,7 @@ paper_trade = Table(
     Column("pnl_net", Float, nullable=True),           # always in INR
     Column("charges", Float, nullable=True),           # always in INR
     Column("atr_at_entry", Float, nullable=False),
+    Column("override", Boolean, nullable=False, server_default=text("false")),
     Column("model_version", Text, nullable=False),
 )
 
@@ -81,8 +82,21 @@ def ensure_table_exists(engine: Engine | None) -> None:
         return
     try:
         metadata.create_all(engine, tables=[paper_trade], checkfirst=True)
+        _ensure_override_column_exists(engine)
     except Exception as exc:
         logger.warning("Failed to ensure paper_trade table exists: %s", exc)
+
+
+def _ensure_override_column_exists(engine: Engine) -> None:
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("paper_trade")}
+        if "override" in cols:
+            return
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE paper_trade ADD COLUMN override BOOLEAN NOT NULL DEFAULT false"))
+        logger.info("Added missing paper_trade.override column")
+    except Exception as exc:
+        logger.warning("Failed to add override column on paper_trade: %s", exc)
 
 
 def _normalize_record(record: dict) -> dict:

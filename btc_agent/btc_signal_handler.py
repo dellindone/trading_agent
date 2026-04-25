@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import pickle
+from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +32,7 @@ class BtcTradeSignal:
     setup_type: str = "trend"
     htf_trend: int = 0
     htf_tf: str = "15m"
+    override: bool = False
 
 
 FUTURES_TAKER_FEE_RATE = 0.0005
@@ -49,6 +52,11 @@ class BtcSignalHandler:
     REVERSAL_SIZE_MULT = 0.50
     REVERSAL_MIN_CONFIDENCE = 0.60
     MAX_CONCURRENT_POSITIONS = 1
+    OVERRIDE_6H_WINDOW = timedelta(hours=6)
+    OVERRIDE_6H_TRIP_R = -5.0
+    OVERRIDE_6H_RELEASE_R = -2.0
+    OVERRIDE_DAY_TRIP_R = -8.0
+    OVERRIDE_WEEK_TRIP_R = -20.0
 
     def __init__(self):
         model_dir = Path(__file__).resolve().parents[1] / "data" / "btc" / "models"
@@ -79,10 +87,128 @@ class BtcSignalHandler:
         usd_to_inr = float(os.getenv("BTC_USD_INR", "83.0"))
         self.INR_TO_USD = (1.0 / usd_to_inr) if usd_to_inr > 0 else 0.012
         self.last_rejection_reason = "NOT_EVALUATED"
+        self.last_override_reached_model = False
+
+        self.override_candidates_seen = 0
+        self.override_blocked_6h = 0
+        self.override_blocked_day = 0
+        self.override_blocked_week = 0
+        self.override_reached_model = 0
+        self.override_rejected_model = 0
+        self.override_executed = 0
+        self.override_shadow_entry_blocked = 0
+
+        now = datetime.now(UTC)
+        self._override_6h_events: deque[tuple[datetime, float]] = deque()
+        self._override_6h_sum = 0.0
+        self._override_6h_tripped = False
+        self._override_day_key = self._utc_day_key(now)
+        self._override_week_key = self._utc_week_key(now)
+        self._override_day_sum = 0.0
+        self._override_week_sum = 0.0
+        self._override_day_tripped = False
+        self._override_week_tripped = False
 
     def _reject(self, reason: str) -> BtcTradeSignal | None:
         self.last_rejection_reason = str(reason)
         return None
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _utc_day_key(ts: datetime) -> tuple[int, int, int]:
+        d = ts.date()
+        return (d.year, d.month, d.day)
+
+    @staticmethod
+    def _utc_week_key(ts: datetime) -> tuple[int, int]:
+        iso = ts.isocalendar()
+        return (iso.year, iso.week)
+
+    def _apply_override_rollovers(self, now_utc: datetime) -> None:
+        day_key = self._utc_day_key(now_utc)
+        if day_key != self._override_day_key:
+            self._override_day_key = day_key
+            self._override_day_sum = 0.0
+            self._override_day_tripped = False
+
+        week_key = self._utc_week_key(now_utc)
+        if week_key != self._override_week_key:
+            self._override_week_key = week_key
+            self._override_week_sum = 0.0
+            self._override_week_tripped = False
+
+    def _prune_override_6h(self, now_utc: datetime) -> None:
+        cutoff = now_utc - self.OVERRIDE_6H_WINDOW
+        while self._override_6h_events and self._override_6h_events[0][0] < cutoff:
+            _, old_r = self._override_6h_events.popleft()
+            self._override_6h_sum -= float(old_r)
+
+    def _refresh_override_6h_latch(self) -> None:
+        if self._override_6h_tripped:
+            if self._override_6h_sum > self.OVERRIDE_6H_RELEASE_R:
+                self._override_6h_tripped = False
+        elif self._override_6h_sum <= self.OVERRIDE_6H_TRIP_R:
+            self._override_6h_tripped = True
+
+    def _refresh_override_fuses(self, now_utc: datetime) -> None:
+        self._apply_override_rollovers(now_utc)
+        self._prune_override_6h(now_utc)
+        self._refresh_override_6h_latch()
+
+    def rebuild_override_fuses(self, close_events: list[tuple[datetime, float]]) -> None:
+        now = datetime.now(UTC)
+        self._override_6h_events.clear()
+        self._override_6h_sum = 0.0
+        self._override_6h_tripped = False
+        self._override_day_key = self._utc_day_key(now)
+        self._override_week_key = self._utc_week_key(now)
+        self._override_day_sum = 0.0
+        self._override_week_sum = 0.0
+        self._override_day_tripped = False
+        self._override_week_tripped = False
+
+        for ts, realized_r in sorted(close_events, key=lambda x: self._as_utc(x[0])):
+            self.ingest_override_realized_r(ts, realized_r)
+        self._refresh_override_fuses(now)
+
+    def ingest_override_realized_r(self, timestamp_exit: datetime, realized_r: float) -> None:
+        ts_utc = self._as_utc(timestamp_exit)
+        r_value = float(realized_r)
+        self._refresh_override_fuses(ts_utc)
+
+        self._override_6h_events.append((ts_utc, r_value))
+        self._override_6h_sum += r_value
+        self._override_day_sum += r_value
+        self._override_week_sum += r_value
+
+        self._refresh_override_6h_latch()
+        if self._override_day_sum <= self.OVERRIDE_DAY_TRIP_R:
+            self._override_day_tripped = True
+        if self._override_week_sum <= self.OVERRIDE_WEEK_TRIP_R:
+            self._override_week_tripped = True
+
+    def _check_override_fuse_block(self, now_utc: datetime) -> str | None:
+        self._refresh_override_fuses(now_utc)
+        if self._override_6h_tripped:
+            return "6h"
+        if self._override_day_tripped:
+            return "day"
+        if self._override_week_tripped:
+            return "week"
+        return None
+
+    def note_override_result(self, executed: bool, model_rejected: bool) -> None:
+        if executed:
+            self.override_executed += 1
+        elif model_rejected:
+            self.override_rejected_model += 1
+        else:
+            self.override_shadow_entry_blocked += 1
 
     def _get_sl_tp_mults(self, row: pd.Series, is_reversal: bool, direction: int) -> tuple[float, float] | None:
         in_bull_ob = int(row.get("in_bull_ob", 0) or 0)
@@ -115,7 +241,9 @@ class BtcSignalHandler:
         capital_inr: float,
         open_trades: int = 0,
         max_concurrent: int = 1,
+        override: bool = False,
     ) -> BtcTradeSignal | None:
+        self.last_override_reached_model = False
         if len(feature_row) != 1:
             raise ValueError("feature_row must be a single-row DataFrame")
 
@@ -135,6 +263,7 @@ class BtcSignalHandler:
         if long_signal == short_signal:
             return self._reject("NO_DIRECTIONAL_CONFLUENCE")
         direction = 1 if long_signal == 1 else -1
+
         if open_trades >= max_concurrent:
             return self._reject(f"MAX_CONCURRENT({open_trades}>={max_concurrent})")
         # Use HTF RSI (45m preferred, 15m fallback, 1m last resort).
@@ -164,6 +293,21 @@ class BtcSignalHandler:
                 x[col] = 0.0
         if self.feature_cols:
             x = x[self.feature_cols]
+
+        if bool(override):
+            self.override_candidates_seen += 1
+            block = self._check_override_fuse_block(datetime.now(UTC))
+            if block == "6h":
+                self.override_blocked_6h += 1
+                return self._reject("OVERRIDE_FUSE_6H")
+            if block == "day":
+                self.override_blocked_day += 1
+                return self._reject("OVERRIDE_FUSE_DAY")
+            if block == "week":
+                self.override_blocked_week += 1
+                return self._reject("OVERRIDE_FUSE_WEEK")
+            self.override_reached_model += 1
+            self.last_override_reached_model = True
 
         probs = active_model.predict_proba(x)[0]
         if len(probs) < 2:
@@ -244,4 +388,5 @@ class BtcSignalHandler:
             setup_type="reversal" if is_reversal else "trend",
             htf_trend=htf_trend,
             htf_tf=htf_tf,
+            override=bool(override),
         )

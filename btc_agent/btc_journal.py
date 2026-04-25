@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -49,6 +49,7 @@ class BtcTradeRecord:
     pnl_inr: float | None
     charges_usd: float | None
     model_version: str
+    override: bool = False
     charges_inr: float | None = None
 
 
@@ -71,6 +72,7 @@ TRADE_COLUMNS = [
     "pnl_inr",
     "charges_usd",
     "charges_inr",
+    "override",
     "model_version",
 ]
 
@@ -136,6 +138,7 @@ def _to_db_row(record: BtcTradeRecord) -> dict:
         "pnl_net": pnl_net_inr,
         "charges": charges_inr,
         "atr_at_entry": record.atr_at_entry,
+        "override": bool(record.override),
         "model_version": record.model_version,
     }
 
@@ -158,9 +161,15 @@ class BtcJournal:
         shaped = df.copy()
         for col in TRADE_COLUMNS:
             if col not in shaped.columns:
-                shaped[col] = pd.NaT if col in DATETIME_COLUMNS else None
+                if col in DATETIME_COLUMNS:
+                    shaped[col] = pd.NaT
+                elif col == "override":
+                    shaped[col] = False
+                else:
+                    shaped[col] = None
         for col in DATETIME_COLUMNS:
             shaped[col] = pd.to_datetime(shaped[col], errors="coerce", utc=True)
+        shaped["override"] = shaped["override"].fillna(False).astype(bool)
         return shaped[TRADE_COLUMNS]
 
     def _read_parquet(self) -> pd.DataFrame:
@@ -172,6 +181,23 @@ class BtcJournal:
             df = pd.read_parquet(self.trades_path)
         df = self._ensure_shape(df)
         return df[df["symbol"].astype(str).str.upper() == "BTCUSDT"].copy()
+
+    def _overlay_override_from_parquet(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        pq = self._read_parquet()
+        if pq.empty or "override" not in pq.columns:
+            return df
+        lookup = (
+            pq.sort_values("timestamp_entry")
+            .drop_duplicates(subset=["trade_id"], keep="last")
+            .set_index("trade_id")["override"]
+        )
+        merged = df.copy()
+        merged["override"] = (
+            merged["trade_id"].astype(str).map(lookup).fillna(False).astype(bool)
+        )
+        return self._ensure_shape(merged)
 
     def _write_parquet(self, df: pd.DataFrame) -> None:
         frame = self._ensure_shape(df)
@@ -216,6 +242,7 @@ class BtcJournal:
                         "pnl_inr": r.get("pnl_net"),
                         "charges_usd": r.get("charges_usd"),
                         "charges_inr": r.get("charges"),
+                        "override": bool(r.get("override", False) or False),
                         "model_version": r.get("model_version"),
                     }
                 )
@@ -260,6 +287,7 @@ class BtcJournal:
                         "pnl_inr": r.get("pnl_net"),
                         "charges_usd": r.get("charges_usd"),
                         "charges_inr": r.get("charges"),
+                        "override": bool(r.get("override", False) or False),
                         "model_version": r.get("model_version"),
                     }
                 )
@@ -337,6 +365,7 @@ class BtcJournal:
             pnl_usd=float(updated_row["pnl_usd"]),
             pnl_inr=float(updated_row["pnl_inr"]),
             charges_usd=float(updated_row["charges_usd"]),
+            override=bool(updated_row.get("override", False) or False),
             model_version=str(updated_row["model_version"]),
             charges_inr=float(updated_row["charges_inr"]) if pd.notna(updated_row.get("charges_inr")) else None,
         )
@@ -345,13 +374,13 @@ class BtcJournal:
     def load_all(self) -> pd.DataFrame:
         db_df = self._load_all_from_db()
         if db_df is not None:
-            return db_df
+            return self._overlay_override_from_parquet(db_df)
         return self._read_parquet()
 
     def load_open_trades(self) -> pd.DataFrame:
         db_df = self._load_open_from_db()
         if db_df is not None:
-            return db_df
+            return self._overlay_override_from_parquet(db_df)
         all_trades = self._read_parquet()
         if all_trades.empty:
             return all_trades
@@ -397,7 +426,68 @@ class BtcJournal:
             pnl_usd=float(row["pnl_usd"]) if pd.notna(row["pnl_usd"]) else None,
             pnl_inr=float(row["pnl_inr"]) if pd.notna(row["pnl_inr"]) else None,
             charges_usd=float(row["charges_usd"]) if pd.notna(row["charges_usd"]) else None,
+            override=bool(row.get("override", False) or False),
             model_version=str(row["model_version"]),
             charges_inr=float(row["charges_inr"]) if ("charges_inr" in row and pd.notna(row["charges_inr"])) else None,
         )
         upsert_trade(self._engine, _to_db_row(record))
+
+    @staticmethod
+    def _compute_realized_r(row: pd.Series) -> float | None:
+        pnl_usd = pd.to_numeric(row.get("pnl_usd"), errors="coerce")
+        entry_price = pd.to_numeric(row.get("entry_price"), errors="coerce")
+        sl_price = pd.to_numeric(row.get("sl_price"), errors="coerce")
+        contracts = pd.to_numeric(row.get("contracts"), errors="coerce")
+        if pd.isna(pnl_usd) or pd.isna(entry_price) or pd.isna(sl_price) or pd.isna(contracts):
+            return None
+        risk_usd = abs(float(entry_price) - float(sl_price)) * float(contracts)
+        if risk_usd <= 0:
+            return None
+        return float(float(pnl_usd) / risk_usd)
+
+    def load_closed_override_events(self, lookback_days: int = 7) -> list[tuple[datetime, float]]:
+        df = self._read_parquet()
+        if df.empty or "override" not in df.columns:
+            return []
+
+        now = datetime.now(UTC)
+        since = now - timedelta(days=max(1, int(lookback_days)))
+        ts = pd.to_datetime(df["timestamp_exit"], errors="coerce", utc=True)
+        override_mask = df["override"].fillna(False).astype(bool)
+        closed_mask = ts.notna()
+        recent_mask = ts >= pd.Timestamp(since)
+        filtered = df.loc[override_mask & closed_mask & recent_mask].copy()
+        if filtered.empty:
+            return []
+        filtered["timestamp_exit"] = pd.to_datetime(filtered["timestamp_exit"], errors="coerce", utc=True)
+        filtered = filtered.sort_values("timestamp_exit")
+
+        events: list[tuple[datetime, float]] = []
+        for _, row in filtered.iterrows():
+            realized_r = self._compute_realized_r(row)
+            if realized_r is None:
+                continue
+            exit_ts = pd.to_datetime(row.get("timestamp_exit"), errors="coerce", utc=True)
+            if pd.isna(exit_ts):
+                continue
+            events.append((exit_ts.to_pydatetime(), float(realized_r)))
+        return events
+
+    def get_closed_override_event(self, trade_id: str) -> tuple[datetime, float] | None:
+        df = self._read_parquet()
+        if df.empty or "override" not in df.columns:
+            return None
+
+        row_df = df[df["trade_id"].astype(str) == str(trade_id)]
+        if row_df.empty:
+            return None
+        row = row_df.iloc[-1]
+        if not bool(row.get("override", False) or False):
+            return None
+        exit_ts = pd.to_datetime(row.get("timestamp_exit"), errors="coerce", utc=True)
+        if pd.isna(exit_ts):
+            return None
+        realized_r = self._compute_realized_r(row)
+        if realized_r is None:
+            return None
+        return (exit_ts.to_pydatetime(), float(realized_r))

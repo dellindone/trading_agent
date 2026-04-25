@@ -110,6 +110,7 @@ class BtcShadowMode:
                 confidence=float(row.get("confidence", 0.0)),
                 direction_prob=float(row.get("direction_prob", 0.0)),
                 atr=float(row.get("atr_at_entry", 0.0)),
+                override=bool(row.get("override", False) or False),
             )
 
             entry_time = datetime.utcnow()
@@ -177,6 +178,7 @@ class BtcShadowMode:
                 pnl_inr=None,
                 charges_usd=None,
                 model_version=self.model_version,
+                override=bool(signal.override),
                 charges_inr=None,
             )
         )
