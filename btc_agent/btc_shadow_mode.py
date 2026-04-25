@@ -69,6 +69,20 @@ class BtcShadowMode:
             for trade in self._open.values()
         ]
 
+    def open_trade_display_snapshots(self) -> list[dict]:
+        """Lightweight snapshot for the live display — no locks needed (display-only)."""
+        return [
+            {
+                "direction": int(t.signal.direction),
+                "entry_price": float(t.signal.entry_price),
+                "current_sl": float(t.current_sl),
+                "target_price": float(t.signal.target_price),
+                "contracts": float(t.signal.contracts),
+                "entry_time": t.entry_time,
+            }
+            for t in self._open.values()
+        ]
+
     def get_any_open_atr(self) -> float:
         for trade in self._open.values():
             atr = float(getattr(trade.signal, "atr", 0.0) or 0.0)

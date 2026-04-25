@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
+import pytz
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]          # .../trading_agent/
@@ -38,6 +39,7 @@ from core.risk.capital_tracker import CapitalTracker
 
 logger = logging.getLogger(__name__)
 USD_TO_INR = float(os.getenv("BTC_USD_INR", "85.0"))
+IST = pytz.timezone("Asia/Kolkata")
 
 
 @dataclass
@@ -91,16 +93,16 @@ class BtcEngine:
         # Live ticker display state.
         self._prev_tick_price: float = 0.0
         self._tick_count: int = 0
-        self._last_ticker_width: int = 0
         self._last_eval_summary: str = "awaiting_first_candle"
+        self._last_eval_data: dict = {}
         self._display_lock = threading.Lock()
         self._latest_display_price: float = 0.0
         self._latest_display_time: datetime | None = None
-        self._last_rendered_line: str = ""
         self._last_rendered_eval_summary: str = ""
         self._last_render_ts: float = 0.0
         self._render_interval_sec: float = 0.20
         self._render_heartbeat_sec: float = 2.0
+        self._display_line_count: int = 0
         # Keep websocket callback lightweight; heavy work runs off-thread.
         self._tick_work_lock = threading.Lock()
         self._tick_worker_running = False
@@ -279,24 +281,119 @@ class BtcEngine:
         summary_changed = self._last_eval_summary != self._last_rendered_eval_summary
         heartbeat_due = (now_ts - self._last_render_ts) >= self._render_heartbeat_sec
         price_changed = price != self._prev_tick_price
-        # Render on new eval result, price movement, or heartbeat; otherwise suppress.
         if not summary_changed and not heartbeat_due and not price_changed:
             return
 
+        arrow = "▲" if price > self._prev_tick_price else ("▼" if price < self._prev_tick_price else "─")
         with self._display_lock:
             tick_age_s = (now_ts - self._latest_display_time.timestamp()) if self._latest_display_time else 0.0
-        stale_tag = f" [stale {int(tick_age_s)}s]" if tick_age_s > 10 else ""
-        line = f"btc = {price:,.2f}{stale_tag} | {self._last_eval_summary}"
-        if line == self._last_rendered_line:
-            return
-        padded = line.ljust(self._last_ticker_width)
-        sys.stdout.write(f"\r\033[2K{padded}")
+        stale = f"  [STALE {tick_age_s:.0f}s]" if tick_age_s > 10 else ""
+
+        time_str = datetime.fromtimestamp(now_ts, tz=IST).strftime("%H:%M:%S IST")
+
+        d = self._last_eval_data
+        bull   = d.get("bull_score", "-")
+        bear   = d.get("bear_score", "-")
+        r1m    = d.get("rsi_1m", 0.0)
+        r15m   = d.get("rsi_15m", 0.0)
+        r45m   = d.get("rsi_45m", 0.0)
+        atr    = d.get("atr_15m", 0.0)
+        h15    = d.get("htf_15m", 0)
+        h45    = d.get("htf_45m", 0)
+        hgate  = d.get("htf_gate", 0)
+        hgtf   = d.get("htf_gate_tf", "?")
+        efst   = d.get("ema_fast", "?")
+        eslw   = d.get("ema_slow", "?")
+        lsig   = d.get("long_signal", 0)
+        ssig   = d.get("short_signal", 0)
+        code   = d.get("outcome_code", self._last_eval_summary)
+        regime = d.get("regime", "?")
+        ot     = d.get("open_trades", 0)
+
+        capital = float(self.capital_tracker.current_capital)
+
+        def _htf(v: int) -> str:
+            return f"{v:+d}" if v != 0 else " 0"
+
+        W = 63
+        sep = "━" * W
+
+        trade_lines: list[str] = []
+        for snap in self.shadow_mode.open_trade_display_snapshots():
+            direction = snap["direction"]
+            entry     = snap["entry_price"]
+            contracts = snap["contracts"]
+            sl        = snap["current_sl"]
+            tp        = snap["target_price"]
+            gross_usd = (price - entry) * contracts * direction
+            gross_inr = gross_usd * USD_TO_INR
+            side      = "LONG" if direction == 1 else "SHORT"
+            age_s     = (datetime.utcnow() - snap["entry_time"]).total_seconds()
+            age_str   = f"{int(age_s // 60)}m{int(age_s % 60):02d}s"
+            upnl_sign = "+" if gross_usd >= 0 else ""
+            pct = (price - entry) / entry * direction * 100 if entry > 0 else 0.0
+            trade_lines.append(sep)
+            trade_lines.append(f"  TRADE    {side}   entry=${entry:,.2f}   SL=${sl:,.2f}   TP=${tp:,.2f}")
+            trade_lines.append(
+                f"  UNREALIZ {upnl_sign}${gross_usd:,.2f} ({upnl_sign}{pct:.2f}%)  "
+                f"({upnl_sign}₹{gross_inr:,.0f})   {contracts:.4f} BTC   age {age_str}"
+            )
+
+        # PROJ block: always rendered for fixed line count (prevents separator
+        # accumulation from variable-height redraws). Shows live levels when
+        # confluence is met (*), placeholders otherwise.
+        if not trade_lines:
+            l_sl_d = d.get("long_sl_dist", 0.0)
+            l_tp_d = d.get("long_tp_dist", 0.0)
+            s_sl_d = d.get("short_sl_dist", 0.0)
+            s_tp_d = d.get("short_tp_dist", 0.0)
+            trade_lines.append(sep)
+            if l_sl_d > 0:
+                l_tag = "LIVE *" if lsig else "PROJ  "
+                l_sl  = price - l_sl_d
+                l_tp  = price + l_tp_d
+                trade_lines.append(
+                    f"  LONG  {l_tag}  SL~${l_sl:,.2f} (-{l_sl_d/price*100:.2f}%)"
+                    f"  entry~${price:,.2f}"
+                    f"  TP~${l_tp:,.2f} (+{l_tp_d/price*100:.2f}%)"
+                )
+            else:
+                trade_lines.append(f"  LONG   ---  awaiting first candle")
+            if s_sl_d > 0:
+                s_tag = "LIVE *" if ssig else "PROJ  "
+                s_sl  = price + s_sl_d
+                s_tp  = price - s_tp_d
+                trade_lines.append(
+                    f"  SHORT {s_tag}  SL~${s_sl:,.2f} (+{s_sl_d/price*100:.2f}%)"
+                    f"  entry~${price:,.2f}"
+                    f"  TP~${s_tp:,.2f} (-{s_tp_d/price*100:.2f}%)"
+                )
+            else:
+                trade_lines.append(f"  SHORT  ---  awaiting first candle")
+
+        lines = [
+            sep,
+            f"  {arrow}  BTC  ${price:>12,.2f}    {time_str}    ticks: {self._tick_count:,}{stale}",
+            f"  REGIME  {regime:<20}  OPEN  {ot}    CAP  ₹{capital:,.0f}",
+            *trade_lines,
+            sep,
+            f"  SCORES   Bull {bull}/11   Bear {bear}/11",
+            f"  RSI      1m {r1m:5.1f}   15m {r15m:5.1f}   45m {r45m:5.1f}    ATR 15m {atr:.0f}",
+            f"  HTF      15m {_htf(h15)}   45m {_htf(h45)}   Gate {_htf(hgate)} ({hgtf})    EMA {efst}/{eslw}",
+            f"  CONFLU   long={lsig}  short={ssig}  (pre-model flags)",
+            f"  DECISION {code}",
+            sep,
+        ]
+
+        if self._display_line_count > 0:
+            sys.stdout.write(f"\033[{self._display_line_count}A\033[J")
+        sys.stdout.write("\n".join(lines) + "\n")
         sys.stdout.flush()
-        self._last_ticker_width = max(self._last_ticker_width, len(line))
-        self._last_rendered_line = line
-        self._last_rendered_eval_summary = self._last_eval_summary
+
+        self._display_line_count = len(lines)
         self._last_render_ts = now_ts
         self._prev_tick_price = price
+        self._last_rendered_eval_summary = self._last_eval_summary
 
     @staticmethod
     def _drop_incomplete_candles(df: pd.DataFrame, tf_minutes: int) -> pd.DataFrame:
@@ -477,15 +574,52 @@ class BtcEngine:
             outcome_code = f"REJECT:{rejection_reason}"
             outcome = f"skip: MODEL_REJECT ({rejection_reason})"
 
-        self._last_eval_summary = (
-            f"bull_score={bull_score}/11 bear_score={bear_score}/11 "
-            f"rsi_1m={rsi_1m:.1f} rsi_15m={rsi_15m:.1f} rsi_45m={rsi_45m:.1f} "
-            f"atr_15m={atr_15m:.0f} htf_15m={htf_trend_15m:+d} htf_45m={htf_trend_45m:+d} "
-            f"htf_gate={htf_trend:+d}({htf_gate_tf}) "
-            f"ema_pair={int(self.signal_handler.ema_fast)}/{int(self.signal_handler.ema_slow)} "
-            f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
-            f" regime={self.signal_handler.last_regime}"
-        )
+        # 11. Compute projected SL/TP distances for BOTH directions so the display
+        #     can always show where a long or short entry would land at current price.
+        #     Uses structure-aware multipliers when OB/FVG is present; falls back to
+        #     the signal handler's default multipliers otherwise.
+        def _proj_dists(direction: int) -> tuple[float, float]:
+            if atr_15m <= 0:
+                return 0.0, 0.0
+            is_rev = (
+                (direction == 1 and int(last.get("reversal_long_signal", 0) or 0) == 1)
+                or (direction == -1 and int(last.get("reversal_short_signal", 0) or 0) == 1)
+            )
+            mults = self.signal_handler._get_sl_tp_mults(last, is_rev, direction)
+            if mults is not None:
+                return float(atr_15m * mults[0]), float(atr_15m * mults[1])
+            return (
+                float(atr_15m * self.signal_handler.SL_ATR_MULT),
+                float(atr_15m * self.signal_handler.TP_ATR_MULT),
+            )
+
+        long_sl_dist,  long_tp_dist  = _proj_dists(1)
+        short_sl_dist, short_tp_dist = _proj_dists(-1)
+
+        self._last_eval_summary = outcome_code
+        self._last_eval_data = {
+            "bull_score": bull_score,
+            "bear_score": bear_score,
+            "rsi_1m": rsi_1m,
+            "rsi_15m": rsi_15m,
+            "rsi_45m": rsi_45m,
+            "atr_15m": atr_15m,
+            "htf_15m": htf_trend_15m,
+            "htf_45m": htf_trend_45m,
+            "htf_gate": htf_trend,
+            "htf_gate_tf": htf_gate_tf,
+            "ema_fast": int(self.signal_handler.ema_fast),
+            "ema_slow": int(self.signal_handler.ema_slow),
+            "long_signal": long_signal,
+            "short_signal": short_signal,
+            "outcome_code": outcome_code,
+            "regime": self.signal_handler.last_regime or "?",
+            "open_trades": open_trades,
+            "long_sl_dist": long_sl_dist,
+            "long_tp_dist": long_tp_dist,
+            "short_sl_dist": short_sl_dist,
+            "short_tp_dist": short_tp_dist,
+        }
 
     def _check_sl_tp_on_closed_candle(self, candle_1m: pd.Series) -> None:
         """Fallback defense: if tick path misses, use closed 1m high/low to enforce exits."""

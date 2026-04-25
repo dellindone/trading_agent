@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import talib
+
+# Set MOMENTUM_GATE_OVERRIDE=1 in environment to activate stale-structure
+# invalidation. Off by default; flip without code changes for shadow comparison.
+MOMENTUM_GATE_OVERRIDE: bool = os.getenv("MOMENTUM_GATE_OVERRIDE", "0") == "1"
 
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 3.0
@@ -73,6 +79,34 @@ def compute_entry_signals(df, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataF
     if "45m_smc_trend" in frame.columns:
         htf_bull_ok &= (frame["45m_smc_trend"] >= 0)   # not -1 (bearish)
         htf_bear_ok &= (frame["45m_smc_trend"] <= 0)   # not +1 (bullish)
+
+        # Stale-structure invalidation (shadow-toggle: set to True to activate).
+        # Only relaxes the gate when BOTH: 15m structure has flipped, AND 45m
+        # momentum already agrees (2-of-3 conditions). Prevents unlocking solely
+        # because time passed or 15m moved alone.
+        if MOMENTUM_GATE_OVERRIDE:
+            def _fcol(name: str) -> pd.Series:
+                return frame[name] if name in frame.columns else pd.Series(0.0, index=frame.index)
+
+            _45m_bear_momentum = (
+                (_fcol("45m_ema8_vs_ema21") < 0).astype(int)
+                + (_fcol("45m_macd_hist") < 0).astype(int)
+                + (_fcol("45m_close_vs_sma50") < 0).astype(int)
+            )
+            _45m_bull_momentum = (
+                (_fcol("45m_ema8_vs_ema21") > 0).astype(int)
+                + (_fcol("45m_macd_hist") > 0).astype(int)
+                + (_fcol("45m_close_vs_sma50") > 0).astype(int)
+            )
+            bear_structure_override = (
+                (_fcol("15m_smc_trend") == -1) & (_45m_bear_momentum >= 2)
+            )
+            bull_structure_override = (
+                (_fcol("15m_smc_trend") == 1) & (_45m_bull_momentum >= 2)
+            )
+            htf_bull_ok |= bull_structure_override
+            htf_bear_ok |= bear_structure_override
+
     elif "15m_smc_trend" in frame.columns:
         htf_bull_ok &= (frame["15m_smc_trend"] >= 0)   # not -1 (bearish)
         htf_bear_ok &= (frame["15m_smc_trend"] <= 0)   # not +1 (bullish)
