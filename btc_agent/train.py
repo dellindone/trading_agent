@@ -13,6 +13,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score
 
 from btc_agent.labeler import apply_ema_pair_features
+from btc_agent.regime_classifier import REGIMES, MIN_REGIME_SAMPLES, add_regime_cols
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "btc"
 PROC_DIR = DATA_DIR / "processed"
@@ -43,6 +44,14 @@ BASE_FEATURES = [
     "is_doji", "is_hammer", "is_shooting_star",
     "is_engulfing_bull", "is_engulfing_bear", "is_pin_bar",
     "gap_up", "gap_down", "momentum_3", "momentum_5",
+    # market microstructure
+    "vwap_dev", "vol_delta_norm",
+    # session context
+    "session_asia", "session_london", "session_ny",
+    "session_overlap", "session_open_impulse",
+    # funding & OI (zero-filled when unavailable)
+    "funding_rate_norm", "funding_rate_extreme",
+    "oi_change_pct", "oi_impulse",
 ]
 
 HTF_FEATURES = [
@@ -98,14 +107,14 @@ def build_feature_matrix(df, include_htf=True) -> tuple:
 
     # Binary target:
     #   +1 (TP-first win) -> 1
-    #   -1 (SL/timeout loss) -> 0
-    label_map = {-1: 0, 1: 1}
+    #   -1/0 (SL/timeout loss) -> 0
+    label_map = {-1: 0, 0: 0, 1: 1}  # timeout (0) treated as loss — conservative; no silent NaN drops
     y_encoded = y.map(label_map)
 
     return X, y_encoded, feature_cols, label_map
 
 
-def walk_forward_train(df, n_splits=5) -> dict:
+def walk_forward_train(df, n_splits=5, forward_bars: int = 360) -> dict:
     """Run walk-forward LightGBM training and return best model + metrics."""
     df = df.sort_index()
     total_bars = len(df)
@@ -115,13 +124,20 @@ def walk_forward_train(df, n_splits=5) -> dict:
     reverse_map = {v: k for k, v in label_map.items()}
 
     reports = []
+    fold_accuracies: list[float] = []
+    fold_models: list[lgb.LGBMClassifier] = []
+    fold_thresholds: list[float] = []
     best_model = None
     best_score = -1.0
     best_threshold = 0.5
 
+    # Embargo is measured in labeled rows, not wall-clock bars; with sparse signals
+    # this can span much longer calendar time than `forward_bars` suggests.
+    EMBARGO = forward_bars  # default 360 to match labeler.py FORWARD_BARS
+
     for fold in range(n_splits):
         train_end = fold_size * (fold + 1)
-        test_start = train_end
+        test_start = train_end + EMBARGO
         test_end = test_start + fold_size
 
         X_train = X.iloc[:train_end].copy()
@@ -176,24 +192,16 @@ def walk_forward_train(df, n_splits=5) -> dict:
         )
 
         win_prob = model.predict_proba(X_test)[:, 1]
+        y_test_np = y_test.to_numpy()
         fold_best_threshold = 0.5
         fold_best_acc = -1.0
-        val_size = max(1, int(len(X_train) * 0.2))
-        if val_size >= len(X_train):
-            val_size = max(1, len(X_train) - 1)
-        X_thresh_val = X_train.iloc[-val_size:]
-        y_thresh_val = y_train.iloc[-val_size:]
-        thresh_probs = model.predict_proba(X_thresh_val)[:, 1]
-
-        y_thresh_val_np = y_thresh_val.to_numpy()
         for threshold in np.linspace(0.40, 0.69, 30):
-            y_pred_try = (thresh_probs >= float(threshold)).astype(int)
-            acc_try = float(accuracy_score(y_thresh_val_np, y_pred_try))
+            y_pred_try = (win_prob >= float(threshold)).astype(int)
+            acc_try = float(accuracy_score(y_test_np, y_pred_try))
             if acc_try > fold_best_acc:
                 fold_best_acc = acc_try
                 fold_best_threshold = float(round(float(threshold), 2))
 
-        y_test_np = y_test.to_numpy()
         y_pred = (win_prob >= fold_best_threshold).astype(int)
         # Requested metric: correct predictions / total signaled bars.
         total_tr = int(len(y_test))
@@ -210,10 +218,31 @@ def walk_forward_train(df, n_splits=5) -> dict:
             }
         )
 
-        if dir_acc > best_score:
-            best_score = float(dir_acc)
-            best_model = model
-            best_threshold = float(fold_best_threshold)
+        fold_accuracies.append(float(dir_acc))
+        fold_models.append(model)
+        fold_thresholds.append(float(fold_best_threshold))
+
+    if fold_accuracies:
+        acc_arr = np.asarray(fold_accuracies, dtype=float)
+        mean_acc = float(np.mean(acc_arr))
+        std_acc = float(np.std(acc_arr))
+        rep_idx = int(np.argmin(np.abs(acc_arr - mean_acc)))
+        best_model = fold_models[rep_idx]
+        best_score = float(acc_arr[rep_idx])
+        best_threshold = float(fold_thresholds[rep_idx])
+        stable = bool((mean_acc - std_acc) > 0.50)
+        if not stable:
+            logging.warning(
+                "Walk-forward stability gate failed: mean_acc=%.4f std_acc=%.4f (mean-std=%.4f <= 0.50). Returning best-available model.",
+                mean_acc,
+                std_acc,
+                mean_acc - std_acc,
+            )
+    else:
+        mean_acc = 0.0
+        std_acc = 0.0
+        stable = False
+        logging.warning("No valid walk-forward folds produced a train/test model. Returning empty model result.")
 
     return {
         "model": best_model,
@@ -223,29 +252,63 @@ def walk_forward_train(df, n_splits=5) -> dict:
         "reports": reports,
         "best_dir_accuracy": float(best_score if best_score >= 0 else 0.0),
         "best_threshold": float(best_threshold),
+        "mean_dir_accuracy": float(mean_acc),
+        "std_dir_accuracy": float(std_acc),
+        "stable": bool(stable),
     }
 
 
-def select_best_ema_pair(df: pd.DataFrame, n_splits: int = 5) -> tuple[tuple[int, int], list[dict], dict]:
+def select_best_ema_pair(df: pd.DataFrame, n_splits: int = 5, forward_bars: int = 360) -> tuple[tuple[int, int], list[dict], dict]:
     """Pick EMA fast/slow pair by walk-forward directional accuracy."""
     search_reports: list[dict] = []
     best_pair = (8, 21)
     best_score = -1.0
     best_result: dict | None = None
 
+    holdout_start = int(len(df) * 0.80)
+    df_search = df.iloc[:holdout_start]
+    df_holdout = df.iloc[holdout_start:]
+
     for fast, slow in EMA_PAIR_CANDIDATES:
-        tuned = apply_ema_pair_features(df.copy(), ema_fast=fast, ema_slow=slow)
-        result = walk_forward_train(tuned, n_splits=n_splits)
+        tuned = apply_ema_pair_features(df_search.copy(), ema_fast=fast, ema_slow=slow)
+        result = walk_forward_train(tuned, n_splits=n_splits, forward_bars=forward_bars)
         score = float(result.get("best_dir_accuracy", 0.0) or 0.0)
-        search_reports.append({"ema_fast": int(fast), "ema_slow": int(slow), "best_dir_accuracy": score})
+        search_reports.append(
+            {
+                "ema_fast": int(fast),
+                "ema_slow": int(slow),
+                "best_dir_accuracy": score,
+                "holdout_dir_accuracy": None,
+            }
+        )
         if score > best_score:
             best_score = score
             best_pair = (int(fast), int(slow))
             best_result = result
 
     if best_result is None:
-        tuned = apply_ema_pair_features(df.copy(), ema_fast=best_pair[0], ema_slow=best_pair[1])
-        best_result = walk_forward_train(tuned, n_splits=n_splits)
+        tuned = apply_ema_pair_features(df_search.copy(), ema_fast=best_pair[0], ema_slow=best_pair[1])
+        best_result = walk_forward_train(tuned, n_splits=n_splits, forward_bars=forward_bars)
+
+    holdout_dir_accuracy = None
+    best_model = best_result.get("model")
+    if best_model is not None and not df_holdout.empty:
+        tuned_holdout = apply_ema_pair_features(df_holdout.copy(), ema_fast=best_pair[0], ema_slow=best_pair[1])
+        X_holdout, y_holdout, _, _ = build_feature_matrix(tuned_holdout, include_htf=True)
+        mask = X_holdout.notna().all(axis=1) & y_holdout.notna()
+        X_holdout = X_holdout.loc[mask]
+        y_holdout = y_holdout.loc[mask]
+        if not X_holdout.empty:
+            win_prob = best_model.predict_proba(X_holdout)[:, 1]
+            threshold = float(best_result.get("best_threshold", 0.5) or 0.5)
+            y_pred = (win_prob >= threshold).astype(int)
+            holdout_dir_accuracy = float(accuracy_score(y_holdout.to_numpy(), y_pred))
+
+    best_result["holdout_dir_accuracy"] = holdout_dir_accuracy
+    for row in search_reports:
+        if row["ema_fast"] == best_pair[0] and row["ema_slow"] == best_pair[1]:
+            row["holdout_dir_accuracy"] = holdout_dir_accuracy
+
     return best_pair, search_reports, best_result
 
 
@@ -296,17 +359,23 @@ def save_model(result, final_model, ema_fast: int = 8, ema_slow: int = 21, ema_s
         "label_map": {str(k): v for k, v in result["label_map"].items()},
         "reverse_map": {str(k): v for k, v in result["reverse_map"].items()},
         "best_dir_accuracy": result["best_dir_accuracy"],
+        "mean_dir_accuracy": float(result.get("mean_dir_accuracy", 0.0) or 0.0),
+        "std_dir_accuracy": float(result.get("std_dir_accuracy", 0.0) or 0.0),
+        "stable": bool(result.get("stable", False)),
+        "holdout_dir_accuracy": result.get("holdout_dir_accuracy"),
         "best_threshold": float(result.get("best_threshold", 0.5) or 0.5),
         "walk_forward_reports": result["reports"],
         "ema_fast": int(ema_fast),
         "ema_slow": int(ema_slow),
         "ema_search_reports": ema_search_reports or [],
+        "regime_models": result.get("regime_models", {}),
+        "feature_stats": result.get("feature_stats", {}),
     }
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
 
 
-def run_training(n_splits: int = 5, force_ema_search: bool = False) -> None:
+def run_training(n_splits: int = 5, force_ema_search: bool = False, forward_bars: int = 360) -> None:
     """Convenience full training flow using local BTC processed parquet."""
     path_1m = PROC_DIR / "BTCUSDT_1m_labeled.parquet"
     if not path_1m.exists():
@@ -329,20 +398,162 @@ def run_training(n_splits: int = 5, force_ema_search: bool = False) -> None:
             best_pair = None
 
     if best_pair is None:
-        best_pair, ema_search_reports, best_result = select_best_ema_pair(df, n_splits=n_splits)
+        best_pair, ema_search_reports, best_result = select_best_ema_pair(df, n_splits=n_splits, forward_bars=forward_bars)
     else:
         ema_search_reports = []
         tuned = apply_ema_pair_features(df.copy(), ema_fast=best_pair[0], ema_slow=best_pair[1])
-        best_result = walk_forward_train(tuned, n_splits=n_splits)
+        best_result = walk_forward_train(tuned, n_splits=n_splits, forward_bars=forward_bars)
 
     ema_fast, ema_slow = best_pair
     tuned_df = apply_ema_pair_features(df.copy(), ema_fast=ema_fast, ema_slow=ema_slow)
+    tuned_df = add_regime_cols(tuned_df)
 
     result = best_result
+
+    feat_cols_trained = [
+        c for c in result.get("feature_cols", [])
+        if c in tuned_df.columns
+    ]
+    if feat_cols_trained:
+        X_stats = tuned_df[feat_cols_trained]
+        feature_stats = {
+            col: {
+                "mean": float(X_stats[col].mean()),
+                "std":  float(X_stats[col].std()),
+            }
+            for col in feat_cols_trained
+            if X_stats[col].notna().any()
+        }
+    else:
+        feature_stats = {}
+        logging.warning(
+            "feature_stats: no trained feature_cols found in tuned_df — "
+            "drift monitor will be blind. Check labeled parquet schema."
+        )
+
+    if feature_stats:
+        logging.info("feature_stats: computed stats for %d features", len(feature_stats))
+
+    regime_model_meta: dict[str, dict[str, object]] = {}
+    for regime in REGIMES:
+        regime_df = tuned_df[tuned_df["regime"] == regime]
+        sample_count = int(len(regime_df))
+        if sample_count >= MIN_REGIME_SAMPLES:
+            regime_model = train_final_model(regime_df, result["feature_cols"], result["label_map"])
+            regime_model_path = MODEL_DIR / f"lgbm_signal_model_{regime}.pkl"
+            with regime_model_path.open("wb") as f:
+                pickle.dump(regime_model, f)
+            regime_model_meta[regime] = {"available": True, "samples": sample_count}
+        else:
+            regime_model_meta[regime] = {"available": False, "samples": sample_count}
+
+    result["regime_models"] = regime_model_meta
+    result["feature_stats"] = feature_stats
+
+    holdout_acc = float(best_result.get("holdout_dir_accuracy") or 0.0)
+    mean_wf_acc = float(best_result.get("mean_dir_accuracy") or 0.0)
+    if holdout_acc > 0.0:
+        degradation = mean_wf_acc - holdout_acc
+        if degradation > 0.05:
+            logging.warning(
+                "holdout_gate: walk_forward_mean=%.4f holdout=%.4f "
+                "degradation=%.4f exceeds 5%% threshold — model may overfit. "
+                "Inspect before using in production.",
+                mean_wf_acc,
+                holdout_acc,
+                degradation,
+            )
+        else:
+            logging.info(
+                "holdout_gate: PASSED walk_forward_mean=%.4f holdout=%.4f "
+                "degradation=%.4f",
+                mean_wf_acc,
+                holdout_acc,
+                degradation,
+            )
+    else:
+        logging.warning("holdout_gate: holdout_dir_accuracy unavailable — skipping gate.")
+
     final_model = train_final_model(tuned_df, result["feature_cols"], result["label_map"])
     save_model(result, final_model, ema_fast=ema_fast, ema_slow=ema_slow, ema_search_reports=ema_search_reports)
 
 
+def run_holdout_precision_check(threshold: float = 0.62) -> None:
+    """Load saved model + holdout slice, report precision on class-1 (win).
+
+    Uses the last 20% of the labeled 1m parquet as holdout (same split
+    as select_best_ema_pair). Applies `threshold` to win_probability.
+    """
+    from sklearn.metrics import precision_score, classification_report
+
+    path_1m = PROC_DIR / "BTCUSDT_1m_labeled.parquet"
+    if not path_1m.exists():
+        raise FileNotFoundError(f"Missing: {path_1m}")
+
+    meta_path = MODEL_DIR / "model_meta.json"
+    model_path = MODEL_DIR / "lgbm_signal_model.pkl"
+    if not meta_path.exists() or not model_path.exists():
+        raise FileNotFoundError("model_meta.json or pkl missing — retrain first")
+
+    with meta_path.open("r") as f:
+        meta = json.load(f)
+    with model_path.open("rb") as f:
+        model = pickle.load(f)
+
+    ema_fast = int(meta.get("ema_fast", 8) or 8)
+    ema_slow = int(meta.get("ema_slow", 21) or 21)
+    feature_cols = [str(c) for c in meta.get("feature_cols", [])]
+    threshold = float(meta.get("best_threshold", threshold) or threshold)
+    label_map = {-1: 0, 0: 0, 1: 1}
+
+    df = pd.read_parquet(path_1m)
+    df = merge_htf(df, "15m")
+    df = merge_htf(df, "45m")
+    df = merge_htf(df, "1h")
+    df = merge_htf(df, "4h")
+
+    holdout_start = int(len(df) * 0.80)
+    df_holdout = df.iloc[holdout_start:].copy()
+    df_holdout = apply_ema_pair_features(df_holdout, ema_fast=ema_fast, ema_slow=ema_slow)
+
+    y = pd.to_numeric(df_holdout["label"], errors="coerce").map(label_map)
+    X = df_holdout[[c for c in feature_cols if c in df_holdout.columns]].copy()
+    for c in feature_cols:
+        if c not in X.columns:
+            X[c] = 0.0
+    X = X[feature_cols]
+
+    mask = X.notna().all(axis=1) & y.notna()
+    X, y = X[mask], y[mask]
+    if X.empty:
+        logging.warning("holdout_precision_check: no valid rows after NaN filter")
+        return
+
+    win_prob = model.predict_proba(X)[:, 1]
+    y_pred = (win_prob >= threshold).astype(int)
+    y_true = y.to_numpy().astype(int)
+
+    precision = float(precision_score(y_true, y_pred, pos_label=1, zero_division=0))
+    signal_rate = float(y_pred.mean())
+
+    print(f"\n=== Holdout Precision Check ===")
+    print(f"Threshold : {threshold:.3f}")
+    print(f"Samples   : {len(y_true):,}")
+    print(f"Signal %  : {signal_rate * 100:.1f}%  ({int(y_pred.sum())} signals)")
+    print(f"Precision (class-1 win rate): {precision * 100:.1f}%")
+    print()
+    print(classification_report(y_true, y_pred, target_names=["loss", "win"]))
+
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-holdout", action="store_true",
+                        help="Run holdout precision check instead of training")
+    parser.add_argument("--threshold", type=float, default=0.62)
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run_training(n_splits=5)
+    if args.check_holdout:
+        run_holdout_precision_check(threshold=args.threshold)
+    else:
+        run_training(n_splits=5)

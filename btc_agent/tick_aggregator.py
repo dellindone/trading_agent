@@ -43,6 +43,8 @@ class TickAggregator:
             size:   Trade size (contracts or BTC quantity).
             ts_ms:  Trade timestamp in milliseconds (Unix epoch).
         """
+        if float(size) <= 0:
+            return  # ignore quote-only updates; candles must be trade-price-only
         ts_sec = float(ts_ms) / 1000.0 if float(ts_ms) > 1e10 else float(ts_ms)
         with self._lock:
             self._ticks.append((ts_sec, float(price), float(size)))

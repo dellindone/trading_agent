@@ -32,11 +32,12 @@ from btc_agent.btc_signal_handler import BtcSignalHandler
 from btc_agent.delta_client import delta_client
 from btc_agent.features import build_features
 from btc_agent.labeler import compute_entry_signals
+from btc_agent.regime_classifier import add_regime_cols
 from btc_agent.train import HTF_FEATURES
 from core.risk.capital_tracker import CapitalTracker
 
 logger = logging.getLogger(__name__)
-USD_TO_INR = float(os.getenv("BTC_USD_INR", "83.0"))
+USD_TO_INR = float(os.getenv("BTC_USD_INR", "85.0"))
 
 
 @dataclass
@@ -105,6 +106,8 @@ class BtcEngine:
         self._tick_worker_running = False
         self._pending_tick: TickSnapshot | None = None
         self._sl_tp_candle_fallback_count: int = 0
+        # (tf_str) -> (last_candle_timestamp | None, featured_df)
+        self._feat_cache: dict[str, tuple[object, pd.DataFrame]] = {}
 
     def run(self):
         self._install_signal_handlers()
@@ -135,6 +138,18 @@ class BtcEngine:
                 return candles
         logger.debug("candles_source=rest tf=%s", tf)
         return self.delta_client.get_ohlcv(tf, bars=bars)
+
+    def _get_features(self, raw: pd.DataFrame, tf: str) -> pd.DataFrame:
+        if raw.empty:
+            return pd.DataFrame()
+        last_ts = raw.index[-1]
+        cached = self._feat_cache.get(tf)
+        if cached is not None and cached[0] == last_ts:
+            return cached[1]
+        feat = build_features(raw)
+        if not feat.empty:
+            self._feat_cache[tf] = (last_ts, feat)
+        return feat
 
     # ------------------------------------------------------------------
     # Tick-driven core — called on every WebSocket trade tick
@@ -261,7 +276,10 @@ class BtcEngine:
         if not summary_changed and not heartbeat_due and not price_changed:
             return
 
-        line = f"btc = {price:,.2f} | {self._last_eval_summary}"
+        with self._display_lock:
+            tick_age_s = (now_ts - self._latest_display_time.timestamp()) if self._latest_display_time else 0.0
+        stale_tag = f" [stale {int(tick_age_s)}s]" if tick_age_s > 10 else ""
+        line = f"btc = {price:,.2f}{stale_tag} | {self._last_eval_summary}"
         if line == self._last_rendered_line:
             return
         padded = line.ljust(self._last_ticker_width)
@@ -334,10 +352,10 @@ class BtcEngine:
             self._check_sl_tp_on_closed_candle(closed_1m.iloc[-1])
 
         # 2. Build features for each TF.
-        feat_1m = build_features(raw_1m)
-        feat_15m = build_features(raw_15m) if not raw_15m.empty else pd.DataFrame()
-        feat_1h = build_features(raw_1h) if not raw_1h.empty else pd.DataFrame()
-        feat_45m = build_features(raw_45m) if not raw_45m.empty else pd.DataFrame()
+        feat_1m  = self._get_features(raw_1m,  "1m")
+        feat_15m = self._get_features(raw_15m, "15m")
+        feat_1h  = self._get_features(raw_1h,  "1h")
+        feat_45m = self._get_features(raw_45m, "45m")
         if feat_1m.empty:
             logger.warning("poll_skipped: empty_1m_features")
             return
@@ -346,6 +364,10 @@ class BtcEngine:
         merged = self._merge_htf_context(feat_1m, feat_15m, "15m")
         merged = self._merge_htf_context(merged, feat_1h, "1h")
         merged = self._merge_htf_context(merged, feat_45m, "45m")
+
+        # 3b. Add regime columns (atr_14_recent / atr_14_hist / regime) so
+        #     classify_regime() in the signal handler has the required columns.
+        merged = add_regime_cols(merged)
 
         # 4. Compute confluence entry signals.
         merged = compute_entry_signals(
@@ -382,13 +404,19 @@ class BtcEngine:
         atr_15m      = float(last.get("15m_atr_14", 0.0) or 0.0)
         rsi          = float(last.get("rsi_14", 0.0) or 0.0)
 
+        open_trades = int(len(self.journal.load_open_trades()))
+
         # 7. Infer signal.
         signal = self.signal_handler.process(
             feature_row=feature_row,
             current_price=current_price,
             capital_inr=float(self.capital_tracker.current_capital),
+            open_trades=open_trades,
         )
         rejection_reason = self.signal_handler.last_rejection_reason
+        drift_alerts = self.signal_handler.last_drift_alerts
+        if drift_alerts:
+            logger.warning("feature_drift_detected alerts=%s", drift_alerts[:5])
 
         # 8. Enter shadow trade + alert.
         trade = None
@@ -442,6 +470,7 @@ class BtcEngine:
             f"htf_gate={htf_trend:+d}({htf_gate_tf}) htf_source={htf_source} "
             f"ema_pair={int(self.signal_handler.ema_fast)}/{int(self.signal_handler.ema_slow)} "
             f"long_signal={long_signal} short_signal={short_signal} {outcome_code}"
+            f" regime={self.signal_handler.last_regime}"
         )
 
     def _check_sl_tp_on_closed_candle(self, candle_1m: pd.Series) -> None:

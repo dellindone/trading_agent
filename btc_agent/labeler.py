@@ -7,7 +7,7 @@ import pandas as pd
 
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 3.0
-FORWARD_BARS = 180
+FORWARD_BARS = 360
 
 
 def apply_ema_pair_features(df: pd.DataFrame, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataFrame:
@@ -111,6 +111,12 @@ def compute_entry_signals(df, ema_fast: int = 8, ema_slow: int = 21) -> pd.DataF
     return frame
 
 
+def _first_hit_index(mask: np.ndarray, fallback: int) -> np.ndarray:
+    any_hit = mask.any(axis=1)
+    first = np.argmax(mask, axis=1)
+    return np.where(any_hit, first, fallback)
+
+
 def label_trades(
     df,
     sl_mult: float = SL_ATR_MULT,
@@ -123,7 +129,8 @@ def label_trades(
 
     Output labels:
       +1 => TP hit before SL (win)
-      -1 => SL hit first OR timeout/no-hit within forward window (loss)
+       0 => timeout/no-hit within forward window
+      -1 => SL hit first
     """
     frame = compute_entry_signals(df.copy(), ema_fast=ema_fast, ema_slow=ema_slow)
 
@@ -135,70 +142,79 @@ def label_trades(
     exit_bars = np.zeros(n, dtype=int)
     actual_rr = np.full(n, np.nan)
 
-    closes = frame["close"].to_numpy()
-    highs = frame["high"].to_numpy()
-    lows = frame["low"].to_numpy()
-    atrs = frame["atr_14"].to_numpy()
+    closes = frame["close"].to_numpy(dtype=float)
+    highs = frame["high"].to_numpy(dtype=float)
+    lows = frame["low"].to_numpy(dtype=float)
+    atrs = frame["atr_14"].to_numpy(dtype=float)
     long_sig = frame["long_signal"].to_numpy()
     short_sig = frame["short_signal"].to_numpy()
 
-    for i in range(n):
-        atr = atrs[i]
-        if np.isnan(atr) or atr <= 0:
-            continue
+    long_only = (long_sig == 1) & (short_sig == 0)
+    short_only = (short_sig == 1) & (long_sig == 0)
+    signaled_mask = long_only | short_only
 
-        direction = 0
-        if long_sig[i] == 1 and short_sig[i] == 0:
-            direction = 1
-        elif short_sig[i] == 1 and long_sig[i] == 0:
-            direction = -1
-        else:
-            continue
+    trade_dir[long_only] = 1
+    trade_dir[short_only] = -1
 
-        trade_dir[i] = direction
+    idx_all = np.flatnonzero(signaled_mask)
+    if idx_all.size:
+        valid_atr = np.isfinite(atrs[idx_all]) & (atrs[idx_all] > 0)
+        idx = idx_all[valid_atr]
 
-        entry = closes[i]
-        sl_dist = atr * float(sl_mult)
-        tp_dist = atr * float(tp_mult)
+        if idx.size:
+            direction = trade_dir[idx]
+            entry = closes[idx]
 
-        if direction == 1:
-            sl = entry - sl_dist
-            tp = entry + tp_dist
-        else:
-            sl = entry + sl_dist
-            tp = entry - tp_dist
+            sl_dist = atrs[idx] * float(sl_mult)
+            tp_dist = atrs[idx] * float(tp_mult)
 
-        sl_prices[i] = sl
-        tp_prices[i] = tp
+            is_long = direction == 1
+            sl = np.where(is_long, entry - sl_dist, entry + sl_dist)
+            tp = np.where(is_long, entry + tp_dist, entry - tp_dist)
 
-        hit = 0
-        max_j = min(i + int(forward_bars), n - 1)
-        for j in range(i + 1, max_j + 1):
-            if direction == 1:
-                if lows[j] <= sl:
-                    hit = -1
-                    exit_bars[i] = j - i
-                    actual_rr[i] = -1.0
-                    break
-                if highs[j] >= tp:
-                    hit = 1
-                    exit_bars[i] = j - i
-                    actual_rr[i] = tp_mult / sl_mult
-                    break
-            else:
-                if highs[j] >= sl:
-                    hit = -1
-                    exit_bars[i] = j - i
-                    actual_rr[i] = -1.0
-                    break
-                if lows[j] <= tp:
-                    hit = 1
-                    exit_bars[i] = j - i
-                    actual_rr[i] = tp_mult / sl_mult
-                    break
+            sl_prices[idx] = sl
+            tp_prices[idx] = tp
 
-        # No neutral class here: timeout/no-hit is a losing trade.
-        labels[i] = 1 if hit == 1 else -1
+            fwd = int(forward_bars)
+
+            high_pad = np.concatenate([highs[1:], np.full(fwd, np.nan)])
+            low_pad = np.concatenate([lows[1:], np.full(fwd, np.nan)])
+            close_pad = np.concatenate([closes[1:], np.full(fwd, np.nan)])
+
+            high_w = np.lib.stride_tricks.sliding_window_view(high_pad, fwd)[idx]
+            low_w = np.lib.stride_tricks.sliding_window_view(low_pad, fwd)[idx]
+            close_w = np.lib.stride_tricks.sliding_window_view(close_pad, fwd)[idx]
+
+            horizon = np.minimum(fwd, n - idx - 1)
+
+            sl_hit = np.where(is_long[:, None], low_w <= sl[:, None], high_w >= sl[:, None])
+            tp_hit = np.where(is_long[:, None], high_w >= tp[:, None], low_w <= tp[:, None])
+
+            first_sl = _first_hit_index(sl_hit, fwd)
+            first_tp = _first_hit_index(tp_hit, fwd)
+
+            has_sl = first_sl < horizon
+            has_tp = first_tp < horizon
+
+            sl_first = has_sl & (~has_tp | (first_sl <= first_tp))
+            tp_first = has_tp & (~has_sl | (first_tp < first_sl))
+            timed_out = ~(sl_first | tp_first)
+
+            labels[idx] = np.where(tp_first, 1, np.where(sl_first, -1, 0))
+            exit_bars[idx] = np.where(sl_first, first_sl + 1, np.where(tp_first, first_tp + 1, horizon))
+
+            timeout_pos = np.clip(horizon - 1, 0, None)
+            timeout_exit = np.where(horizon > 0, close_w[np.arange(idx.size), timeout_pos], entry)
+            exit_price = np.where(sl_first, sl, np.where(tp_first, tp, timeout_exit))
+
+            denom = sl_dist
+            pnl = np.where(is_long, exit_price - entry, entry - exit_price)
+            actual_rr[idx] = np.divide(
+                pnl,
+                denom,
+                out=np.full(idx.size, np.nan, dtype=float),
+                where=denom > 0,
+            )
 
     frame["label"] = labels
     frame["trade_dir"] = trade_dir
@@ -207,7 +223,6 @@ def label_trades(
     frame["exit_bars"] = exit_bars
     frame["actual_rr"] = actual_rr
 
-    # Keep only rows where confluence signaled an entry.
     signaled = ((frame["long_signal"] == 1) | (frame["short_signal"] == 1))
     return frame.loc[signaled].copy()
 
@@ -218,13 +233,16 @@ def print_label_stats(df):
     shorts = int((df["trade_dir"] == -1).sum()) if "trade_dir" in df.columns else 0
     long_wins = int(((df["trade_dir"] == 1) & (df["label"] == 1)).sum()) if "label" in df.columns else 0
     short_wins = int(((df["trade_dir"] == -1) & (df["label"] == 1)).sum()) if "label" in df.columns else 0
+    timeouts = int((df["label"] == 0).sum()) if "label" in df.columns else 0
 
     long_wr = (long_wins / longs * 100.0) if longs else 0.0
     short_wr = (short_wins / shorts * 100.0) if shorts else 0.0
+    timeout_pct = (timeouts / total * 100.0) if total else 0.0
 
     print(f"Total bars: {total:,}")
     print(f"Long signals: {longs:,} | Wins: {long_wins:,} | WR: {long_wr:.1f}%")
     print(f"Short signals: {shorts:,} | Wins: {short_wins:,} | WR: {short_wr:.1f}%")
+    print(f"Timeouts: {timeouts:,} | Timeout %: {timeout_pct:.1f}%")
 
     if "exit_bars" in df.columns:
         mean_exit = pd.to_numeric(df["exit_bars"], errors="coerce")

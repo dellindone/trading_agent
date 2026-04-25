@@ -119,10 +119,11 @@ def fetch_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int)
             "ignore",
         ],
     )
-    df = df[["timestamp", "open", "high", "low", "close", "volume", "trades"]].copy()
+    df = df[["timestamp", "open", "high", "low", "close", "volume",
+             "taker_buy_base", "trades"]].copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
 
-    for col in ["open", "high", "low", "close", "volume"]:
+    for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["trades"] = pd.to_numeric(df["trades"], errors="coerce").fillna(0).astype(int)
 

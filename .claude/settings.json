@@ -7,7 +7,10 @@
       "Bash(python3 -c ' *)",
       "mcp__code-review-graph__semantic_search_nodes_tool",
       "mcp__code-review-graph__get_architecture_overview_tool",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:www.preprints.org)",
+      "WebFetch(domain:link.springer.com)"
     ]
   },
   "hooks": {

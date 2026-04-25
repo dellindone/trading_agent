@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from btc_agent.drift_monitor import DriftMonitor
+from btc_agent.regime_classifier import REGIMES, classify_regime
+
 
 @dataclass
 class BtcTradeSignal:
@@ -37,13 +40,15 @@ BTC_CONTRACT   = 0.001     # minimum position increment (0.001 BTC)
 
 class BtcSignalHandler:
     MIN_CONFIDENCE  = 0.55
-    RISK_PCT        = 0.01   # risk 1% of capital per trade
+    BASE_RISK_PCT   = 0.01   # maximum risk fraction at full confidence
+    RISK_PCT        = BASE_RISK_PCT   # risk 1% of capital per trade (backward-compatible alias)
     SL_ATR_MULT     = 1.5
     TP_ATR_MULT     = 3.0
     MAX_FEE_PCT_OF_TP = 0.30
     MAX_LEVERAGE    = 10.0   # 1000% = 10x leverage cap
     REVERSAL_SIZE_MULT = 0.50
     REVERSAL_MIN_CONFIDENCE = 0.60
+    MAX_CONCURRENT_POSITIONS = 1
 
     def __init__(self):
         model_dir = Path(__file__).resolve().parents[1] / "data" / "btc" / "models"
@@ -61,6 +66,16 @@ class BtcSignalHandler:
         self.ema_fast = int(meta.get("ema_fast", 8) or 8)
         self.ema_slow = int(meta.get("ema_slow", 21) or 21)
         self.MIN_CONFIDENCE = float(meta.get("best_threshold", self.MIN_CONFIDENCE) or self.MIN_CONFIDENCE)
+        self._regime_models: dict[str, object] = {}
+        for regime in REGIMES:
+            path = model_dir / f"lgbm_signal_model_{regime}.pkl"
+            if path.exists():
+                with path.open("rb") as f:
+                    self._regime_models[regime] = pickle.load(f)
+        feature_stats = meta.get("feature_stats", {})
+        self.drift_monitor = DriftMonitor(feature_stats)
+        self.last_drift_alerts: list[str] = []
+        self.last_regime: str = "unknown"
         usd_to_inr = float(os.getenv("BTC_USD_INR", "83.0"))
         self.INR_TO_USD = (1.0 / usd_to_inr) if usd_to_inr > 0 else 0.012
         self.last_rejection_reason = "NOT_EVALUATED"
@@ -69,7 +84,38 @@ class BtcSignalHandler:
         self.last_rejection_reason = str(reason)
         return None
 
-    def process(self, feature_row: pd.DataFrame, current_price: float, capital_inr: float) -> BtcTradeSignal | None:
+    def _get_sl_tp_mults(self, row: pd.Series, is_reversal: bool, direction: int) -> tuple[float, float] | None:
+        in_bull_ob = int(row.get("in_bull_ob", 0) or 0)
+        in_bear_ob = int(row.get("in_bear_ob", 0) or 0)
+        bull_fvg = int(row.get("bull_fvg", 0) or 0)
+        bear_fvg = int(row.get("bear_fvg", 0) or 0)
+
+        if direction == 1:
+            in_dir_ob = in_bull_ob == 1
+            in_dir_fvg = bull_fvg == 1
+        else:
+            in_dir_ob = in_bear_ob == 1
+            in_dir_fvg = bear_fvg == 1
+
+        if is_reversal and in_dir_ob and in_dir_fvg:
+            return 1.0, 4.0
+
+        if (not is_reversal) and in_dir_ob and in_dir_fvg:
+            return 1.2, 3.5
+
+        if (not is_reversal) and (in_dir_ob or in_dir_fvg) and not (in_dir_ob and in_dir_fvg):
+            return 1.5, 3.0
+
+        return None  # no directional structure — reject
+
+    def process(
+        self,
+        feature_row: pd.DataFrame,
+        current_price: float,
+        capital_inr: float,
+        open_trades: int = 0,
+        max_concurrent: int = 1,
+    ) -> BtcTradeSignal | None:
         if len(feature_row) != 1:
             raise ValueError("feature_row must be a single-row DataFrame")
 
@@ -80,11 +126,22 @@ class BtcSignalHandler:
 
         # Confluence gate first: only evaluate model if a directional setup fired.
         row = feature_row.iloc[-1]
+        self.last_drift_alerts = self.drift_monitor.check(row)
+        regime = classify_regime(row)
+        self.last_regime = regime
+        active_model = self._regime_models.get(regime, self.model)
         long_signal = int(row.get("long_signal", 0) or 0)
         short_signal = int(row.get("short_signal", 0) or 0)
         if long_signal == short_signal:
             return self._reject("NO_DIRECTIONAL_CONFLUENCE")
         direction = 1 if long_signal == 1 else -1
+        if open_trades >= max_concurrent:
+            return self._reject(f"MAX_CONCURRENT({open_trades}>={max_concurrent})")
+        rsi = float(row.get("rsi_14", 50.0) or 50.0)
+        if direction == 1 and rsi > 80:
+            return self._reject(f"RSI_OVERBOUGHT({rsi:.1f})")
+        if direction == -1 and rsi < 20:
+            return self._reject(f"RSI_OVERSOLD({rsi:.1f})")
         bull_score = int(row.get("bull_score", 0) or 0)
         bear_score = int(row.get("bear_score", 0) or 0)
         htf_tf = "45m" if "45m_smc_trend" in feature_row.columns else "15m"
@@ -101,7 +158,7 @@ class BtcSignalHandler:
         if self.feature_cols:
             x = x[self.feature_cols]
 
-        probs = self.model.predict_proba(x)[0]
+        probs = active_model.predict_proba(x)[0]
         if len(probs) < 2:
             return self._reject("MODEL_OUTPUT_INVALID")
 
@@ -122,8 +179,12 @@ class BtcSignalHandler:
         if atr <= 0:
             return self._reject("ATR_INVALID")
 
-        sl_dist = atr * self.SL_ATR_MULT
-        tp_dist = atr * self.TP_ATR_MULT
+        mults = self._get_sl_tp_mults(row, is_reversal, direction)
+        if mults is None:
+            return self._reject("NO_STRUCTURE_CONFLUENCE")
+        sl_mult, tp_mult = mults
+        sl_dist = atr * sl_mult
+        tp_dist = atr * tp_mult
         if sl_dist <= 0:
             return self._reject("SL_DISTANCE_INVALID")
 
@@ -139,7 +200,10 @@ class BtcSignalHandler:
         # Risk X% of capital in USD; divide by SL distance in $ to get BTC size.
         capital_usd = capital_inr * self.INR_TO_USD
         risk_mult = self.REVERSAL_SIZE_MULT if is_reversal else 1.0
-        risk_usd = capital_usd * self.RISK_PCT * risk_mult
+        confidence_scale = (win_probability - min_confidence) / (1.0 - min_confidence)
+        confidence_scale = max(0.1, min(1.0, confidence_scale))
+        kelly_risk_pct = self.RISK_PCT * confidence_scale
+        risk_usd = capital_usd * kelly_risk_pct * risk_mult
         raw_btc = risk_usd / sl_dist  # BTC needed to lose exactly risk_usd on SL hit
         # Round down to nearest 0.001 BTC increment, enforce minimum.
         contracts = max(BTC_CONTRACT, int(raw_btc / BTC_CONTRACT) * BTC_CONTRACT)

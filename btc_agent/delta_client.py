@@ -285,6 +285,14 @@ class DeltaClient:
                 self._last_ws_price = price
                 self._last_ws_symbol = symbol or None
                 self._last_ws_ts = time.time()
+                # Drive display + SL/TP from quotes — far more frequent than actual trades.
+                # size=0 marks this as a quote update; tick aggregator (candle building)
+                # ignores zero-size ticks via add_tick, so candles stay trade-price-only.
+                if self._tick_callback is not None:
+                    try:
+                        self._tick_callback(price, 0.0, self._last_ws_ts * 1000)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
