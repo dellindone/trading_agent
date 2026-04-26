@@ -288,9 +288,9 @@ class BtcSignalHandler:
         )
 
         x = feature_row.copy()
-        for col in self.feature_cols:
-            if col not in x.columns:
-                x[col] = 0.0
+        missing = [col for col in self.feature_cols if col not in x.columns]
+        if missing:
+            return self._reject(f"FEATURE_CONTRACT_VIOLATION(missing={len(missing)}:{missing[:3]})")
         if self.feature_cols:
             x = x[self.feature_cols]
 

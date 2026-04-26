@@ -162,8 +162,26 @@ def walk_forward_train(df, n_splits=5, forward_bars: int = 360) -> dict:
             )
             continue
 
-        pos = int((y_train == 1).sum())
-        neg = int((y_train == 0).sum())
+        val_size = int(len(X_train) * 0.20)
+        if val_size > 0:
+            X_val = X_train.iloc[-val_size:].copy()
+            y_val = y_train.iloc[-val_size:].copy()
+            X_fit = X_train.iloc[:-val_size].copy()
+            y_fit = y_train.iloc[:-val_size].copy()
+        else:
+            X_val = X_train.iloc[0:0].copy()
+            y_val = y_train.iloc[0:0].copy()
+            X_fit = X_train.copy()
+            y_fit = y_train.copy()
+
+        if X_fit.empty:
+            X_fit = X_train.copy()
+            y_fit = y_train.copy()
+            X_val = X_train.iloc[0:0].copy()
+            y_val = y_train.iloc[0:0].copy()
+
+        pos = int((y_fit == 1).sum())
+        neg = int((y_fit == 0).sum())
         scale_pos_weight = (neg / max(pos, 1)) if pos > 0 else 1.0
 
         model = lgb.LGBMClassifier(
@@ -185,23 +203,26 @@ def walk_forward_train(df, n_splits=5, forward_bars: int = 360) -> dict:
         )
 
         model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_test, y_test)],
+            X_fit,
+            y_fit,
+            eval_set=[(X_val, y_val)] if not X_val.empty else [(X_fit, y_fit)],
             callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
         )
 
+        fold_best_threshold = 0.5
+        if not X_val.empty:
+            val_prob = model.predict_proba(X_val)[:, 1]
+            y_val_np = y_val.to_numpy()
+            fold_best_acc = -1.0
+            for threshold in np.linspace(0.40, 0.69, 30):
+                y_pred_try = (val_prob >= float(threshold)).astype(int)
+                acc_try = float(accuracy_score(y_val_np, y_pred_try))
+                if acc_try > fold_best_acc:
+                    fold_best_acc = acc_try
+                    fold_best_threshold = float(round(float(threshold), 2))
+
         win_prob = model.predict_proba(X_test)[:, 1]
         y_test_np = y_test.to_numpy()
-        fold_best_threshold = 0.5
-        fold_best_acc = -1.0
-        for threshold in np.linspace(0.40, 0.69, 30):
-            y_pred_try = (win_prob >= float(threshold)).astype(int)
-            acc_try = float(accuracy_score(y_test_np, y_pred_try))
-            if acc_try > fold_best_acc:
-                fold_best_acc = acc_try
-                fold_best_threshold = float(round(float(threshold), 2))
-
         y_pred = (win_prob >= fold_best_threshold).astype(int)
         # Requested metric: correct predictions / total signaled bars.
         total_tr = int(len(y_test))
@@ -272,12 +293,13 @@ def select_best_ema_pair(df: pd.DataFrame, n_splits: int = 5, forward_bars: int 
     for fast, slow in EMA_PAIR_CANDIDATES:
         tuned = apply_ema_pair_features(df_search.copy(), ema_fast=fast, ema_slow=slow)
         result = walk_forward_train(tuned, n_splits=n_splits, forward_bars=forward_bars)
-        score = float(result.get("best_dir_accuracy", 0.0) or 0.0)
+        score = float(result.get("mean_dir_accuracy", 0.0) or 0.0) - float(result.get("std_dir_accuracy", 0.0) or 0.0)
         search_reports.append(
             {
                 "ema_fast": int(fast),
                 "ema_slow": int(slow),
-                "best_dir_accuracy": score,
+                "best_dir_accuracy": float(result.get("best_dir_accuracy", 0.0) or 0.0),
+                "ema_selection_score": float(score),
                 "holdout_dir_accuracy": None,
             }
         )
@@ -454,14 +476,15 @@ def run_training(n_splits: int = 5, force_ema_search: bool = False, forward_bars
     if holdout_acc > 0.0:
         degradation = mean_wf_acc - holdout_acc
         if degradation > 0.05:
-            logging.warning(
+            logging.error(
                 "holdout_gate: walk_forward_mean=%.4f holdout=%.4f "
                 "degradation=%.4f exceeds 5%% threshold — model may overfit. "
-                "Inspect before using in production.",
+                "Blocking save.",
                 mean_wf_acc,
                 holdout_acc,
                 degradation,
             )
+            return
         else:
             logging.info(
                 "holdout_gate: PASSED walk_forward_mean=%.4f holdout=%.4f "

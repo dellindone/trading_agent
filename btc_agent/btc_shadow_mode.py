@@ -105,12 +105,17 @@ class BtcShadowMode:
             trade_id = str(row["trade_id"])
             direction = int(row["direction"])
             entry_price = float(row["entry_price"])
+            initial_sl_price = (
+                float(row["initial_sl_price"])
+                if ("initial_sl_price" in row and pd.notna(row["initial_sl_price"]))
+                else float(row["sl_price"])
+            )
 
             signal = BtcTradeSignal(
                 symbol=str(row["symbol"]),
                 direction=direction,
                 entry_price=entry_price,
-                sl_price=float(row["sl_price"]),
+                sl_price=initial_sl_price,
                 target_price=float(row["target_price"]),
                 contracts=float(row["contracts"]),
                 confidence=float(row.get("confidence", 0.0)),
@@ -187,6 +192,7 @@ class BtcShadowMode:
                 model_version=self.model_version,
                 override=bool(signal.override),
                 charges_inr=None,
+                initial_sl_price=float(signal.sl_price),
             )
         )
         return trade

@@ -13,7 +13,7 @@ import pandas as pd
 
 from btc_agent.data_collector import TIMEFRAMES, collect_all_timeframes, sync_delta_candles
 from btc_agent.features import build_features
-from btc_agent.labeler import label_trades, print_label_stats
+from btc_agent.labeler import FORWARD_BARS, label_trades, print_label_stats
 from btc_agent.train import (
     DATA_DIR,
     HTF_FEATURES,
@@ -174,8 +174,8 @@ def run_pipeline(skip_download: bool = False, skip_features: bool = False) -> No
         raise FileNotFoundError(f"Missing 1m labeled input: {path_1m}")
 
     df_1m = pd.read_parquet(path_1m)
-    if len(df_1m) > 60:
-        df_1m = df_1m.iloc[:-60]  # drop unlabeled forward-sim tail
+    if len(df_1m) > FORWARD_BARS:
+        df_1m = df_1m.iloc[:-FORWARD_BARS]
 
     best_pair, ema_search_reports, best_result = select_best_ema_pair(df_1m, n_splits=5)
     ema_fast, ema_slow = best_pair

@@ -40,6 +40,7 @@ paper_trade = Table(
     Column("contracts", Float, nullable=True),
     Column("pnl_usd", Float, nullable=True),
     Column("charges_usd", Float, nullable=True),
+    Column("initial_sl_price", Float, nullable=True),
 
     # Shared columns
     Column("sl_price", Float, nullable=False),
@@ -90,13 +91,15 @@ def ensure_table_exists(engine: Engine | None) -> None:
 def _ensure_override_column_exists(engine: Engine) -> None:
     try:
         cols = {c["name"] for c in inspect(engine).get_columns("paper_trade")}
-        if "override" in cols:
-            return
         with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE paper_trade ADD COLUMN override BOOLEAN NOT NULL DEFAULT false"))
-        logger.info("Added missing paper_trade.override column")
+            if "override" not in cols:
+                conn.execute(text("ALTER TABLE paper_trade ADD COLUMN override BOOLEAN NOT NULL DEFAULT false"))
+                logger.info("Added missing paper_trade.override column")
+            if "initial_sl_price" not in cols:
+                conn.execute(text("ALTER TABLE paper_trade ADD COLUMN initial_sl_price FLOAT"))
+                logger.info("Added missing paper_trade.initial_sl_price column")
     except Exception as exc:
-        logger.warning("Failed to add override column on paper_trade: %s", exc)
+        logger.warning("Failed to add missing columns on paper_trade: %s", exc)
 
 
 def _normalize_record(record: dict) -> dict:

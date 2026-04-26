@@ -51,6 +51,7 @@ class BtcTradeRecord:
     model_version: str
     override: bool = False
     charges_inr: float | None = None
+    initial_sl_price: float | None = None
 
 
 TRADE_COLUMNS = [
@@ -72,6 +73,7 @@ TRADE_COLUMNS = [
     "pnl_inr",
     "charges_usd",
     "charges_inr",
+    "initial_sl_price",
     "override",
     "model_version",
 ]
@@ -109,7 +111,7 @@ def _to_db_row(record: BtcTradeRecord) -> dict:
         pnl_gross_usd = float(record.pnl_usd)
     else:
         pnl_gross_usd = None
-    return {
+    row = {
         "trade_id": record.trade_id,
         "instrument": record.symbol,
         "timestamp_entry": record.timestamp_entry,
@@ -138,9 +140,11 @@ def _to_db_row(record: BtcTradeRecord) -> dict:
         "pnl_net": pnl_net_inr,
         "charges": charges_inr,
         "atr_at_entry": record.atr_at_entry,
+        "initial_sl_price": record.initial_sl_price,
         "override": bool(record.override),
         "model_version": record.model_version,
     }
+    return {key: value for key, value in row.items() if key in paper_trade.c}
 
 
 class BtcJournal:
@@ -191,12 +195,18 @@ class BtcJournal:
         lookup = (
             pq.sort_values("timestamp_entry")
             .drop_duplicates(subset=["trade_id"], keep="last")
-            .set_index("trade_id")["override"]
+            .set_index("trade_id")
         )
         merged = df.copy()
         merged["override"] = (
-            merged["trade_id"].astype(str).map(lookup).fillna(False).astype(bool)
+            merged["trade_id"].astype(str).map(lookup["override"]).fillna(False).astype(bool)
         )
+        if "initial_sl_price" in lookup.columns:
+            merged["initial_sl_price"] = merged["trade_id"].astype(str).map(lookup["initial_sl_price"])
+            merged["initial_sl_price"] = merged["initial_sl_price"].where(
+                merged["initial_sl_price"].notna(),
+                merged.get("sl_price"),
+            )
         return self._ensure_shape(merged)
 
     def _write_parquet(self, df: pd.DataFrame) -> None:
@@ -242,6 +252,7 @@ class BtcJournal:
                         "pnl_inr": r.get("pnl_net"),
                         "charges_usd": r.get("charges_usd"),
                         "charges_inr": r.get("charges"),
+                        "initial_sl_price": r.get("initial_sl_price"),
                         "override": bool(r.get("override", False) or False),
                         "model_version": r.get("model_version"),
                     }
@@ -287,6 +298,7 @@ class BtcJournal:
                         "pnl_inr": r.get("pnl_net"),
                         "charges_usd": r.get("charges_usd"),
                         "charges_inr": r.get("charges"),
+                        "initial_sl_price": r.get("initial_sl_price"),
                         "override": bool(r.get("override", False) or False),
                         "model_version": r.get("model_version"),
                     }
@@ -368,6 +380,11 @@ class BtcJournal:
             override=bool(updated_row.get("override", False) or False),
             model_version=str(updated_row["model_version"]),
             charges_inr=float(updated_row["charges_inr"]) if pd.notna(updated_row.get("charges_inr")) else None,
+            initial_sl_price=(
+                float(updated_row["initial_sl_price"])
+                if pd.notna(updated_row.get("initial_sl_price"))
+                else float(updated_row["sl_price"])
+            ),
         )
         upsert_trade(self._engine, _to_db_row(record))
 
@@ -429,6 +446,11 @@ class BtcJournal:
             override=bool(row.get("override", False) or False),
             model_version=str(row["model_version"]),
             charges_inr=float(row["charges_inr"]) if ("charges_inr" in row and pd.notna(row["charges_inr"])) else None,
+            initial_sl_price=(
+                float(row["initial_sl_price"])
+                if ("initial_sl_price" in row and pd.notna(row["initial_sl_price"]))
+                else float(row["sl_price"])
+            ),
         )
         upsert_trade(self._engine, _to_db_row(record))
 
@@ -436,7 +458,8 @@ class BtcJournal:
     def _compute_realized_r(row: pd.Series) -> float | None:
         pnl_usd = pd.to_numeric(row.get("pnl_usd"), errors="coerce")
         entry_price = pd.to_numeric(row.get("entry_price"), errors="coerce")
-        sl_price = pd.to_numeric(row.get("sl_price"), errors="coerce")
+        initial_sl_price = pd.to_numeric(row.get("initial_sl_price"), errors="coerce")
+        sl_price = initial_sl_price if pd.notna(initial_sl_price) else pd.to_numeric(row.get("sl_price"), errors="coerce")
         contracts = pd.to_numeric(row.get("contracts"), errors="coerce")
         if pd.isna(pnl_usd) or pd.isna(entry_price) or pd.isna(sl_price) or pd.isna(contracts):
             return None
