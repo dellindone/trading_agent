@@ -32,6 +32,7 @@ INR_TO_USD = 1.0 / USD_TO_INR if USD_TO_INR > 0 else 0.012
 ENTRY_FEE_MODE = str(os.getenv("BTC_ENTRY_FEE_MODE", "taker")).strip().lower()
 EXIT_FEE_MODE = str(os.getenv("BTC_EXIT_FEE_MODE", "taker")).strip().lower()
 COOLDOWN_MINUTES = 5           # no re-entry for 5 min after a TIMEOUT exit
+TIMEOUT_MINUTES = 360          # match labeler.FORWARD_BARS for live/train parity
 TRAIL_ACTIVATION_ATR = 1.0
 TRAIL_STEP_ATR = 1.0
 MARGIN_PCT = 0.10
@@ -90,6 +91,11 @@ class BtcShadowMode:
                 return atr
         return 0.0
 
+    @staticmethod
+    def _required_margin_inr(contracts: float, entry_price: float) -> float:
+        notional_usd = abs(float(contracts) * float(entry_price))
+        return float(notional_usd * MARGIN_PCT * USD_TO_INR)
+
     def _restore_open_trades(self) -> None:
         open_df = self.journal.load_open_trades()
         if open_df.empty:
@@ -127,7 +133,8 @@ class BtcShadowMode:
                 best_price=entry_price,
                 bars_held=0,
             )
-            self.capital_tracker._reserved_margin.setdefault(trade_id, float(signal.contracts) * MARGIN_PCT)
+            required_margin = self._required_margin_inr(signal.contracts, signal.entry_price)
+            self.capital_tracker._reserved_margin.setdefault(trade_id, required_margin)
 
     def enter_trade(self, signal: BtcTradeSignal) -> BtcShadowTrade | None:
         if self._open:
@@ -139,7 +146,7 @@ class BtcShadowMode:
             if elapsed < COOLDOWN_MINUTES:
                 return None
 
-        required_margin = float(signal.contracts) * MARGIN_PCT
+        required_margin = self._required_margin_inr(signal.contracts, signal.entry_price)
         if self.capital_tracker.get_available_capital() < required_margin:
             return None
 
@@ -212,6 +219,12 @@ class BtcShadowMode:
                     closed.append(trade_id)
                     continue
 
+            elapsed_minutes = (current_time - trade.entry_time).total_seconds() / 60.0
+            if elapsed_minutes >= TIMEOUT_MINUTES:
+                self._close_trade(trade_id, price, "TIMEOUT", current_time)
+                closed.append(trade_id)
+                continue
+
             trade.bars_held += 1
 
             self._update_trailing_sl(trade, high=high, low=low, atr=atr)
@@ -268,6 +281,10 @@ class BtcShadowMode:
         if trade is None:
             return
         logger.info("trade_closed trade_id=%s exit_price=%.2f reason=%s", trade_id, float(exit_price), str(reason))
+
+        if str(reason) == "TIMEOUT":
+            self._last_timeout_exit = timestamp_exit
+            self._last_timeout_direction = int(trade.signal.direction)
 
         pnl_usd, pnl_inr, charges_usd, charges_inr = self._compute_pnl(trade, exit_price)
         # pnl_usd and pnl_inr are already NET of fees — do not deduct again.

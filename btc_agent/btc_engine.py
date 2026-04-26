@@ -340,37 +340,31 @@ class BtcEngine:
                 f"({upnl_sign}₹{gross_inr:,.0f})   {contracts:.4f} BTC   age {age_str}"
             )
 
-        # PROJ block: always rendered for fixed line count (prevents separator
-        # accumulation from variable-height redraws). Shows live levels when
-        # confluence is met (*), placeholders otherwise.
+        # PROJ block: only render the side that has a live signal firing.
         if not trade_lines:
             l_sl_d = d.get("long_sl_dist", 0.0)
             l_tp_d = d.get("long_tp_dist", 0.0)
             s_sl_d = d.get("short_sl_dist", 0.0)
             s_tp_d = d.get("short_tp_dist", 0.0)
             trade_lines.append(sep)
-            if l_sl_d > 0:
-                l_tag = "LIVE *" if lsig else "PROJ  "
-                l_sl  = price - l_sl_d
-                l_tp  = price + l_tp_d
+            if lsig and l_sl_d > 0:
+                l_sl = price - l_sl_d
+                l_tp = price + l_tp_d
                 trade_lines.append(
-                    f"  LONG  {l_tag}  SL~${l_sl:,.2f} (-{l_sl_d/price*100:.2f}%)"
+                    f"  LONG  LIVE *  SL~${l_sl:,.2f} (-{l_sl_d/price*100:.2f}%)"
                     f"  entry~${price:,.2f}"
                     f"  TP~${l_tp:,.2f} (+{l_tp_d/price*100:.2f}%)"
                 )
-            else:
-                trade_lines.append(f"  LONG   ---  awaiting first candle")
-            if s_sl_d > 0:
-                s_tag = "LIVE *" if ssig else "PROJ  "
-                s_sl  = price + s_sl_d
-                s_tp  = price - s_tp_d
+            elif ssig and s_sl_d > 0:
+                s_sl = price + s_sl_d
+                s_tp = price - s_tp_d
                 trade_lines.append(
-                    f"  SHORT {s_tag}  SL~${s_sl:,.2f} (+{s_sl_d/price*100:.2f}%)"
+                    f"  SHORT LIVE *  SL~${s_sl:,.2f} (+{s_sl_d/price*100:.2f}%)"
                     f"  entry~${price:,.2f}"
                     f"  TP~${s_tp:,.2f} (-{s_tp_d/price*100:.2f}%)"
                 )
             else:
-                trade_lines.append(f"  SHORT  ---  awaiting first candle")
+                trade_lines.append(f"  no signal  ---  watching")
 
         lines = [
             sep,
@@ -453,17 +447,17 @@ class BtcEngine:
             logger.warning("poll_skipped: no_1m_candles")
             return
         closed_1m = self._drop_incomplete_candles(raw_1m, tf_minutes=1)
+        closed_15m = self._drop_incomplete_candles(raw_15m, tf_minutes=15)
+        closed_1h = self._drop_incomplete_candles(raw_1h, tf_minutes=60)
         if not closed_1m.empty:
             self._check_sl_tp_on_closed_candle(closed_1m.iloc[-1])
 
         # 2. Build features on CLOSED bars only so indicators match Delta Exchange UI.
-        # The current partial bar is excluded — its RSI/MACD would reflect only
-        # 1-2 ticks and diverge wildly from the last closed bar seen on the chart.
-        # Entry price is always fetched live from get_btc_price() so execution
-        # price is unaffected by this change.
+        # Partial HTF bars can temporarily show a different structure/indicator state
+        # than the last fully closed candle visible on the chart.
         feat_1m  = self._get_features(closed_1m, "1m")
-        feat_15m = self._get_features(raw_15m, "15m")
-        feat_1h  = self._get_features(raw_1h,  "1h")
+        feat_15m = self._get_features(closed_15m, "15m")
+        feat_1h  = self._get_features(closed_1h,  "1h")
         feat_45m = self._get_features(raw_45m, "45m")
         if feat_1m.empty:
             logger.warning("poll_skipped: empty_1m_features")

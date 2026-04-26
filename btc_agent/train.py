@@ -97,7 +97,7 @@ def build_feature_matrix(df, include_htf=True) -> tuple:
     feature_cols = BASE_FEATURES.copy()
 
     if include_htf:
-        for tf in ["15m", "1h", "4h"]:
+        for tf in ["15m", "45m", "1h"]:
             feature_cols += [f"{tf}_{c}" for c in HTF_FEATURES]
 
     feature_cols = [c for c in feature_cols if c in df.columns]
@@ -385,7 +385,6 @@ def run_training(n_splits: int = 5, force_ema_search: bool = False, forward_bars
     df = merge_htf(df, "15m")
     df = merge_htf(df, "45m")
     df = merge_htf(df, "1h")
-    df = merge_htf(df, "4h")
     meta_path = MODEL_DIR / "model_meta.json"
     best_pair: tuple[int, int] | None = None
     if not force_ema_search and meta_path.exists():
@@ -510,7 +509,6 @@ def run_holdout_precision_check(threshold: float = 0.62) -> None:
     df = merge_htf(df, "15m")
     df = merge_htf(df, "45m")
     df = merge_htf(df, "1h")
-    df = merge_htf(df, "4h")
 
     holdout_start = int(len(df) * 0.80)
     df_holdout = df.iloc[holdout_start:].copy()
